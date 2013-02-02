@@ -1,0 +1,6741 @@
+#!/usr/bin/perl
+#    _       _           _
+#   /_\  _ _| |_ ___ ___| |__
+#  / _ \| ' \  _/ -_) -_) / /
+# /_/ \_\_||_\__\___\___|_\_\
+#
+# Anteek - interactive talker environment
+# Copyright (C) 2000  Douglas Richard Hanks Jr
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+use strict;
+
+use DBI;
+
+use IO::Socket;
+use IO::Select;
+
+use Fcntl;
+use POSIX;
+
+# Grab FIONREAD, if possible
+require 'sys/ioctl.ph';
+
+# Deprecated --
+# Compile fionread.c and set this constant's value to its output
+# Last resort only! ^^^^^^^^^^^^^^^^^^^^^^^vvvvvvvvvvv^^^^^^^^^^
+#use constant FIONREAD			=> "0x00541b";
+
+# Constants for player channels
+
+use constant CHAN_ROOM			=> 'channel_room';
+use constant CHAN_SHOUT			=> 'channel_shout';
+use constant CHAN_TELL			=> 'channel_tell';
+use constant CHAN_FRIEND		=> 'channel_friend';
+use constant CHAN_ECHO			=> 'channel_echo';
+use constant CHAN_SU			=> 'channel_su';
+use constant CHAN_ADMIN			=> 'channel_admin';
+use constant CHAN_CUSTOM		=> 'channel_custom';
+use constant CHAN_NORMAL		=> 'channel_normal';
+use constant CHAN_HILITE		=> 'channel_normal';
+
+use constant NORMAL			=> 0;
+use constant RED			=> 1;
+use constant GREEN			=> 2;
+use constant BROWN			=> 3;
+use constant BLUE			=> 4;
+use constant MAGENTA			=> 5;
+use constant CYAN			=> 6;
+use constant LT_GRAY			=> 7;
+use constant DK_GRAY			=> 8;
+use constant LT_RED			=> 9;
+use constant LT_GREEN			=> 10;
+use constant YELLOW			=> 11;
+use constant LT_BLUE			=> 12;
+use constant LT_MAGENTA			=> 13;
+use constant LT_CYAN			=> 14;
+use constant WHITE			=> 15;
+use constant BOLD			=> 16;
+use constant UNDERLINE			=> 17;
+use constant REVERSE			=> 18;
+use constant FAINT			=> 19;
+use constant BLACK			=> 20;
+
+# Connection type
+
+use constant INF_ZOMBIE			=> 0;
+use constant INF_DISCONNECT		=> 1;
+use constant INF_CONNECT		=> 2;
+use constant INF_REANIMATE		=> 3;
+use constant INF_RECONNECT		=> 4;
+
+# Constants for room directions
+
+use constant NORTH			=> 1;
+use constant SOUTH			=> 2;
+use constant EAST			=> 3;
+use constant WEST			=> 4;
+use constant UP				=> 5;
+use constant DOWN			=> 6;
+use constant DELETE			=> 7;
+
+use constant MALE			=> (1<<0);
+use constant FEMALE			=> (1<<1);
+
+# Socket flags
+
+use constant ALPHA			=> (1<<0);
+use constant DISCONNECT			=> (1<<1);
+use constant EDITOR			=> (1<<2);
+use constant LOGGED_IN			=> (1<<3);
+use constant PROMPT			=> (1<<4);
+use constant TELOPT			=> (1<<5);
+use constant ZOMBIE			=> (1<<6);
+use constant DO_ECHO			=> (1<<7);
+
+# Player flags
+
+use constant INFORM_ALL			=> (1<<0);
+use constant USE_AUTO_TERM		=> (1<<1);
+use constant NO_COLOR			=> (1<<2);
+
+# Player privs
+
+use constant NEWBIE			=> (1<<0);
+use constant RESIDENT			=> (1<<1);
+use constant MAIL			=> (1<<2);
+use constant NEWS			=> (1<<3);
+use constant SESSION			=> (1<<4);
+use constant BUILDER			=> (1<<5);
+use constant EXTRA1			=> (1<<6);
+use constant EXTRA2			=> (1<<7);
+use constant EXTRA3			=> (1<<8);
+use constant EXTRA4			=> (1<<9);
+use constant SETHBOY			=> (1<<10);
+use constant PSU			=> (1<<11);
+use constant SU				=> (1<<12);
+use constant ASU			=> (1<<13);
+use constant LOWER_ADMIN		=> (1<<14);
+use constant ADMIN			=> (1<<15);
+use constant CODER			=> (1<<16);
+use constant HCADMIN			=> (1<<17);
+
+# Telnet control
+
+use constant IAC			=> "\377";
+use constant DONT			=> "\376";
+use constant DO				=> "\375";
+use constant WONT			=> "\374";
+use constant WILL			=> "\373";
+use constant SB				=> "\372";
+use constant GA				=> "\371";
+use constant EL				=> "\370";
+use constant EC				=> "\367";
+use constant AYT			=> "\366";
+use constant AO				=> "\365";
+use constant IP				=> "\364";
+use constant BREAK			=> "\363";
+use constant DM				=> "\362";
+use constant NOP			=> "\361";
+use constant SE				=> "\360";
+use constant EOR			=> "\357";
+use constant ABORT			=> "\356";
+use constant SUSP			=> "\355";
+use constant xEOF			=> "\354";
+use constant TELOPT_ECHO		=> "\001";
+use constant TELOPT_NAWS		=> "\037";
+use constant TELOPT_NEW_ENVIRON		=> "\047";
+
+my @word_tens =  ('', 'ten', 'twenty', 'thirty', 'fourty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety');
+my @word_units = ('none', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine');
+my @word_teens = ('ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen');
+
+my %command;		# User-command structure
+my $channel = 0;	# Color type
+
+my $config;		# Stores data from anteek.conf
+my $socket;		# Anonymous hash for socket list
+my $player;		# Same goes for player
+my $room;		# room,
+my $help;		# help,
+my $object;		# object,
+my $zone;		# and zones.
+my $file;		# For cached files in lib/files/*
+my $index = 0;		# Key calculations for $socket and $player
+my $dbh;		# DB Handle
+
+my $socket_listen;	# We'll listen on this
+my $socket_select;	# Multiplex on this
+
+Makelog('boot', "\n\n\n--\nAnteek Booting\n--");
+
+Initiate::Configuration();
+Initiate::Database();
+Initiate::Files();
+Initiate::Help();
+Initiate::Socket::Listen();
+Initiate::Socket::Fcntl();
+Initiate::Socket::Select();
+Initiate::Daemon();
+Initiate::Timer();
+Initiate::Commands();
+Initiate::Zones();
+Initiate::Rooms();
+
+while(1)
+{
+	Socket::Handle::Input();
+	Socket::Handle::Output();
+	Socket::Handle::Error();
+	Socket::Handle::Disconnect();
+}
+
+Initiate::Shutdown();
+exit(0);
+
+##############################################################################
+
+sub Makelog
+{
+	my ($type, $str) = @_;
+	my $stime = strftime("%b %d %T::", gmtime);
+
+	open(LOG, ">>var/log/$type") or warn "Cannot open $type for writting!\n";
+	print LOG $stime, $str, "\n";
+	close(LOG);
+	return (0);
+}
+
+sub Socket::Handle::Disconnect
+{
+	foreach my $client (keys %{$socket})
+	{
+		if($socket->{$client}{state} & DISCONNECT)
+		{
+			Socket::Process::Disconnect($client);
+		}
+}
+	return (0);
+}
+
+sub Socket::Handle::Error
+{
+	foreach my $client ($socket_select->has_error(0))
+	{
+		Socket::Process::Disconnect($client);
+	}
+	return (0);
+}
+
+sub Socket::Handle::Output
+{
+	foreach my $client ($socket_select->can_write(3))
+	{
+		my $i = Socket::Find::Node($client);
+
+		Socket::Process::Output($i);
+	}
+	return (0);
+}
+
+sub Socket::Handle::Input
+{
+	foreach my $client ($socket_select->can_read(3))
+	{
+		if($client eq $socket_listen)
+		{
+			++$index;
+			$socket->{$index}{sock} = $socket_listen->accept;
+			$socket_select->add($socket->{$index}{sock});
+
+			my $flags = fcntl($socket->{$index}{sock}, F_GETFL, 0) or
+			die "$0: Socket::Handle::Input: $!\n";
+
+			fcntl($socket->{$index}{sock}, F_GETFL, $flags | O_NONBLOCK) or
+			die "$0: Socket::Handle::Input: $!\n";
+
+			($socket->{$index}{port}, $socket->{$index}{addr}) =
+			sockaddr_in($socket->{$index}{sock}->peername());
+
+			$socket->{$index}{ip} = inet_ntoa($socket->{$index}{addr});
+
+			# We're basically sending the telnet protocol to request termsize
+			my $str = "\377\375\037";
+			syswrite($socket->{$index}{sock}, $str, length($str));
+
+			$socket->{$index}{x} = 79;
+			Makelog('connections', "new connection from $socket->{$index}{ip} assigning socket id $index");
+			Player::Handle::New($index);
+		}
+		else
+		{
+			Socket::Process::Input($client);
+		}
+	}
+	return (0);
+}
+
+sub Socket::Process::Disconnect
+{
+	my $client = shift;
+
+	exists($socket->{$client}) or return (-1);
+
+	Player::Inform($client, INF_DISCONNECT);
+
+	if($player->{$client}{state} & ZOMBIE)
+	{
+		# Let's keep player structures around for zombies
+		Room::Tell($player->{$client}{room}, $client, "% $player->{$client}{name} slumps into a decaying mass of ooz.\n");
+		Player::Inform($client, INF_ZOMBIE);
+
+		Makelog('disconnect', "disconnecting id $client from $socket->{$client}{ip}");
+		$socket_select->remove($socket->{$client}{sock});
+		$socket->{$client}{sock}->close;
+		delete $socket->{$client};
+
+		return (0);
+	}
+
+	Room::Tell($player->{$client}{room}, $client, "% $player->{$client}{name} $player->{$client}{disconnectmsg}\n");
+
+	Makelog('disconnect', "disconnecting id $client from $socket->{$client}{ip}");
+	$socket_select->remove($socket->{$client}{sock});
+	$socket->{$client}{sock}->close;
+
+	delete $socket->{$client};
+	delete $player->{$client};
+	return (0);
+}
+
+sub Socket::Process::Input
+{
+	my $client = shift;
+	my $i = Socket::Find::Node($client);
+	my $buf;
+	my $buffer;
+	my $nread;
+
+	# Don't forget to compile fionread.c to grab the correct constant
+	# for FIONREAD - this will tell us how much is wating to be read
+
+	$nread = pack('L', 0);
+	ioctl($socket->{$i}{sock}, &FIONREAD, $nread);
+	$nread = unpack('L', $nread);
+
+#	$nread = sysread($socket->{$i}{sock}, $buf, 1024);
+
+	if($nread <= 0)
+	{
+		$socket->{$i}{state} |= DISCONNECT;
+		return (-1);
+	}
+
+	$buf =~ s/\r\n/\n/g;
+	$buf =~ s/\r/\n/g;
+
+	my @parse = split(//, $buf);
+	my @sync;
+	my $c = 0;
+
+	while(length($parse[$c]))
+	{
+		if($parse[$c] eq IAC)
+		{
+			$c++;
+			if($parse[$c] eq AYT)
+			{
+				AYT:
+				my $str = "No-one here but us pigeons!\n\r";
+
+				syswrite($socket->{$i}{sock}, $str, length($str));
+			}
+			elsif($parse[$c] eq IP || $parse[$c] eq BREAK)
+			{
+				$socket->{$i}{state} |= DISCONNECT;
+				return (-1);
+			}
+			elsif($parse[$c] eq EC)
+			{
+				pop(@sync);
+			}
+			elsif($parse[$c] eq EL)
+			{
+				@sync = undef;
+			}
+			elsif($parse[$c] eq DO)
+			{
+				$c++;
+				if($parse[$c] eq TELOPT_ECHO)
+				{
+					$socket->{$i}{state} |= DO_ECHO;
+				}
+			}
+			elsif($parse[$c] eq DONT || $parse[$c] eq WONT)
+			{
+				$c++;
+			}
+			elsif($parse[$c] eq WILL)
+			{
+				WILL:
+				$c++;
+				if($parse[$c] eq TELOPT_NEW_ENVIRON)
+				{
+					my $code = "\377\372\047\001\000USER\000ACCT\000\003\377\360";
+
+					syswrite($socket->{$i}{sock}, $code, length($code));
+				}
+			}
+			elsif($parse[$c] eq SB)
+			{
+				SB:
+				$c++;
+				if($parse[$c] eq TELOPT_NAWS)
+				{
+					my ($x, $y);
+
+					$c++;
+					($x, $y) = unpack("n2", substr(join('', @parse), $c, 4));
+					$c += 4;
+					$socket->{$i}{x} = $x;
+					$socket->{$i}{y} = $y;
+					$socket->{$i}{state} |= TELOPT;
+				}
+				elsif($parse[$c] eq TELOPT_NEW_ENVIRON)
+				{
+					while($parse[$c] && $parse[$c] ne IAC)
+					{
+						$c++;
+					}
+				}
+			}
+		}
+		elsif($parse[$c] eq WILL)
+		{
+			goto WILL;
+		}
+		elsif($parse[$c] eq SB)
+		{
+			goto SB;
+		}
+		elsif($parse[$c] eq "\n")
+		{
+			$socket->{$i}{input} .= join('', @sync);
+			chomp($socket->{$i}{input});
+			$player->{$i}{idle} = 0;
+
+			unless($player->{$i}{state} & EDITOR)
+			{
+				$socket->{$i}{input} =~ s/^\s*//;
+				$socket->{$i}{input} =~ s/\s*$//;
+			}
+
+			if(exists($player->{$i}))
+			{
+				if(exists($player->{$i}{func}))
+				{
+					my $func = $player->{$i}{func};
+
+					$config->{'mfaults'} += &$func($i, $socket->{$i}{input});
+					Player::DoPrompt($i);
+					@sync = undef;
+					delete $socket->{$i}{input};
+				}
+				else
+				{
+					Socket::Process::Command($i, $socket->{$i}{input});
+					Player::DoPrompt($i);
+				}
+			}
+			else
+			{
+				Makelog('process_input', "Received input on a stale socket without a player structure");
+				$socket->{$i}{state} |= DISCONNECT;
+				@sync = undef;
+				delete $socket->{$i}{input};
+			}
+			delete $socket->{$i}{input};
+			@sync = undef;
+		}
+		else
+		{
+			$parse[$c] =~ s/[^\w\s\d\`\~\!\@\#\$\%\^\&\*\(\)\_\-\+\=\[\{\]\}\;\:\'\"\\\|\,\<\.\>\/\?]//g;
+			push(@sync, $parse[$c]);
+		}
+	$c++;
+	}
+	$socket->{$i}{input} .= join('', @sync);
+	return (0);
+}
+
+sub Socket::Process::Command
+{
+	my $i = shift;
+
+	$_ = shift;
+
+	length($_) or return (-1);
+
+	if(/^(\w\W)/)
+	{
+		if(exists($command{$1}) && $player->{$i}{privs} & $command{$1}{priv})
+		{
+			my $func = $command{$1}{func};
+
+			if(/^\w\W\s*(.*)$/)
+			{
+				my $str = undef;
+
+				length($1) and $str = $1;
+				$config->{'mfaults'} += &$func($i, $str);
+				$player->{$i}{redo} = $str;
+			}
+			else
+			{
+				$config->{'mfaults'} += &$func($i, undef);
+			}
+
+			delete $socket->{$i}{input};
+			return (0);
+		}
+	}
+
+	if(/^(\w+)/)
+	{
+		my $com = $1;
+
+		$com =~ tr/A-Z/a-z/;
+		if(exists($command{$com}) && $player->{$i}{privs} & $command{$com}{priv})
+		{
+			my $func = $command{$com}{func};
+
+			if(/^\w+\s+(.*)$/)
+			{
+				my $str = undef;
+
+				length($1) and $str = $1;
+				$config->{'mfaults'} += &$func($i, $str);
+				$player->{$i}{redo} = $str;
+			}
+			else
+			{
+				$config->{'mfaults'} += &$func($i, undef);
+			}
+
+			delete $socket->{$i}{input};
+			return (0);
+		}
+	}
+
+	if(/^(\W\W)/)
+	{
+		my $com = $1;
+		if(exists($command{$1}) && $player->{$i}{privs} & $command{$1}{priv})
+		{
+			my $func = $command{$1}{func};
+
+			if(/^\W\W\s*(.*)$/)
+			{
+				my $str = undef;
+
+				length($1) and $str = $1;
+				$config->{'mfaults'} += &$func($i, $str);
+				$player->{$i}{redo} = $str unless ($com eq '@');
+			}
+			else
+			{
+				$config->{'mfaults'} += &$func($i, undef);
+			}
+
+			delete $socket->{$i}{input};
+			return (0);
+		}
+	}
+
+	if(/^(\W)/)
+	{
+		my $com = $1;
+		if(exists($command{$1}) && $player->{$i}{privs} & $command{$1}{priv})
+		{
+			my $func = $command{$1}{func};
+
+			if(/^\W\s*(.*)$/)
+			{
+				my $str = undef;
+
+				length($1) and $str = $1;
+				$config->{'mfaults'} += &$func($i, $str);
+				$player->{$i}{redo} = $str unless ($com eq '@');
+			}
+			else
+			{
+				$config->{'mfaults'} += &$func($i, undef);
+			}
+
+			delete $socket->{$i}{input};
+			return (0);
+		}
+	}
+
+	Player::Tell($i, "^NCouldn't find the command `$_'^N\n");
+	delete $socket->{$i}{input};
+	return (-1);
+}
+
+sub Socket::Process::WordWrap
+{
+	my $client = shift;
+	my $str = shift;
+	my $len = 0;
+	my $i = 0;
+	my @output = split(//, $str);
+	my @sync;
+
+	while(length($output[$i]))
+	{
+		my $c = $output[$i];
+
+		if($len >= ($socket->{$client}{x} - 5))
+		{
+			push(@sync, "\n");
+			$len = 0;
+		}
+
+		if($c eq "\n")
+		{
+			$len = 0;
+			push(@sync, "\n");
+			$i++;
+			next;
+		}
+		elsif($c eq "\t")
+		{
+			$len += 5;
+			push(@sync, "\t");
+		}
+		elsif($c eq '^')
+		{
+			$i++;
+			push(@sync, $c);
+			push(@sync, $output[$i]);
+		}
+		else
+		{
+			$len++;
+			push(@sync, $c);
+		}
+		$i++;
+	}
+	return (join('', @sync));
+}
+
+sub Socket::Process::Color
+{
+	my $i = shift;
+	$_ = shift;
+
+	if($player->{$i}{flags} & NO_COLOR)
+	{
+		s/\^[\w|.]//g;
+		return $_;
+	}
+
+	my %c = (	'N',	=> "\033[0m",
+			'H',	=> "\033[1m",
+			'F',	=> "\033[2m",
+			'i',	=> "\033[5m",
+			'I',	=> "\033[7m",
+			'K',	=> "\033[0;30m",
+			'r',	=> "\033[0;31m",
+			'g',	=> "\033[0;32m",
+			'y',	=> "\033[0;33m",
+			'b',	=> "\033[0;34m",
+			'p',	=> "\033[0;35m",
+			'c',	=> "\033[0;36m",
+			'a',	=> "\033[0;37m",
+			'A',	=> "\033[1;30m",
+			'R',	=> "\033[1;31m",
+			'G',	=> "\033[1;32m",
+			'Y',	=> "\033[1;33m",
+			'B',	=> "\033[1;34m",
+			'P',	=> "\033[1;35m",
+			'C',	=> "\033[1;36m",
+			'W',	=> "\033[1;37m",
+			'U',	=> "\033[4m",
+			'V',	=> "\033[7m",
+			'F',	=> "\033[2m",
+			'K',	=> "\033[5m",
+			'^',	=> '^',
+		);
+
+	s/%V/$config->{'talker.version'}/g;
+	if(/\^(.)/g)
+	{
+		s/\^(.)/$c{$1}/g;
+	}
+
+	return ($_);
+}
+
+sub Socket::Process::Output
+{
+	my $i = shift;
+	my $str = shift;
+
+	length($str) or return (-1);
+
+	my %chan = (	0	=> 'N',
+			1	=> 'r',
+			2	=> 'g',
+			3	=> 'y',
+			4	=> 'b',
+			5	=> 'p',
+			6	=> 'c',
+			7	=> 'A',
+			8	=> 'a',
+			9	=> 'R',
+			10	=> 'G',
+			11	=> 'Y',
+			12	=> 'B',
+			13	=> 'P',
+			14	=> 'C',
+			15	=> 'W',
+			16	=> 'H',
+			17	=> 'U',
+			18	=> 'V',
+			19	=> 'F',
+			20	=> 'K',
+		);
+
+	my %c = (	'N',	=> "\033[0m",
+			'H',	=> "\033[1m",
+			'F',	=> "\033[2m",
+			'i',	=> "\033[5m",
+			'I',	=> "\033[7m",
+			'K',	=> "\033[0;30m",
+			'r',	=> "\033[0;31m",
+			'g',	=> "\033[0;32m",
+			'y',	=> "\033[0;33m",
+			'b',	=> "\033[0;34m",
+			'p',	=> "\033[0;35m",
+			'c',	=> "\033[0;36m",
+			'a',	=> "\033[0;37m",
+			'A',	=> "\033[1;30m",
+			'R',	=> "\033[1;31m",
+			'G',	=> "\033[1;32m",
+			'Y',	=> "\033[1;33m",
+			'B',	=> "\033[1;34m",
+			'P',	=> "\033[1;35m",
+			'C',	=> "\033[1;36m",
+			'W',	=> "\033[1;37m",
+			'U',	=> "\033[4m",
+			'V',	=> "\033[7m",
+			'F',	=> "\033[2m",
+			'K',	=> "\033[5m",
+			'^',	=> '^',
+		);
+
+	$str = Socket::Process::Color($i, Socket::Process::WordWrap($i, $str));
+
+	my $tmp = $channel;
+	my $string;
+
+	if(($channel eq CHAN_TELL || $channel eq CHAN_FRIEND || $channel eq CHAN_SU || $channel eq CHAN_ADMIN) && 
+	$player->{$i}{flags} & NO_COLOR)
+	{
+		$string = "\033[1m";
+	}
+
+	$string = $c{$chan{$player->{$i}{$tmp}}} unless($player->{$i}{flags} & NO_COLOR);
+	$string .= $str;
+	$string .= "\033[0m";
+	$str = $string;
+
+	if(exists($socket->{$i}))
+	{
+		$str =~ s/\n/\r\n/g;
+		syswrite($socket->{$i}{sock}, $str, length($str));
+	}
+	else
+	{
+		return (-1);
+	}
+}
+
+sub Socket::Find::Node
+{
+	my $client = shift;
+
+	length($client) or return (-1);
+
+	foreach my $i (keys %{$socket})
+	{
+		exists($socket->{$i}{sock}) or next;
+		if($socket->{$i}{sock} eq $client)
+		{
+			return $i;
+		}
+	}
+
+	return (-1);
+}
+
+sub Initiate::Socket::Listen
+{
+	my %socket;
+
+	$socket{'LocalPort'} = $config->{'talker.port'};
+	$socket{'Proto'} = 'tcp';
+	$socket{'Type'} = SOCK_STREAM;
+	$socket{'Listen'} = 10;
+	$socket{'Reuse'} = 1;
+
+	$socket_listen = IO::Socket::INET->new(%socket) or
+	die "$0: Initiate::Socket::Listen: $!\n";
+
+	Makelog('boot', "Alive and kicking on port $config->{'talker.port'}");
+	return (0);
+}
+
+sub Initiate::Socket::Fcntl
+{
+	my $flags = fcntl($socket_listen, F_GETFL, 0) or
+	die "$0: Initiate::Socket::Fcntl: $!\n";
+
+	fcntl($socket_listen, F_GETFL, $flags | O_NONBLOCK) or
+	die "$0: Initiate::Socket::Fcntl: $!\n";
+
+	Makelog('boot', "Set listener to NONBLOCKing");
+	return (0);
+}
+
+sub Initiate::Socket::Select
+{
+	$socket_select = IO::Select->new($socket_listen) or
+	die "$0: Initiate::Socket::Select: $!\n";
+
+	Makelog('boot', "Started SELECT");
+	return (0);
+}
+
+sub Initiate::Daemon
+{
+	$| = 1;
+	$SIG{'PIPE'} = 'IGNORE';
+	fork && exit if($config->{'config.fork'} eq 'yes');
+	exists($config->{'config.stdout'}) and open(STDOUT, $config->{'config.stdout'});
+	exists($config->{'config.stderr'}) and open(STDERR, $config->{'config.stderr'});
+	exists($config->{'config.chdir'}) and chdir($config->{'config.chdir'}) or
+	die "Cannot chdir to $config->{'config.chdir'}\n";
+
+	Makelog('boot', "Configured process as a daemon");
+	return (0);
+}
+
+sub Initiate::Configuration
+{
+	my $mode = (stat('etc/anteek.conf'))[2];
+
+	if($mode & 00004 || $mode & 00002 || $mode & 00040 || $mode & 00020 || $mode & 00200 || $mode & 00100)
+	{
+		print STDOUT "Warning:  configuration file has insecure permissions.  Changing to 0400.\n";
+		chmod 0400, 'etc/anteek.conf';
+	}
+
+	$config->{'boot'} = strftime("%I.%M:%S - %a, %d %B", gmtime);
+
+	open(CONFIG, '<etc/anteek.conf') or
+	die "Couldn't open etc/anteek.conf for reading.\n";
+
+	while(<CONFIG>)
+	{
+		s/#.*$//;
+		s/^\s*//;
+		s/\s*$//;
+		/\S/ or next;
+
+		(my $key, my $val) = split(/\s*=\s*/, $_, 2);
+		$key =~ tr/A-Z/a-z/;
+		$config->{$key} = $val;
+	}
+
+	close(CONFIG);
+
+	$config->{'talker.name'} ||= 'Anteek';
+	$config->{'talker.port'} ||= 2010;
+
+	Makelog('boot', "Loaded Configuration");
+	return (0);
+}
+
+sub Initiate::Database
+{
+	$dbh = DBI->connect("DBI:mysql:$config->{'mysql.database'}", $config->{'mysql.username'}, $config->{'mysql.password'}) or
+	die "Cannot connect to the database: $!\n";
+
+	Makelog('boot', "Connected to database $config->{'mysql.database'}");
+	return (0);
+}
+
+sub Initiate::Help
+{
+	my $current_topic;
+
+	open(HELP, '<lib/help/database') or warn "cannot open lib/help/database for reading: $!\n";
+	while(<HELP>)
+	{
+		s/#.*$//;
+
+		if(/^\@topic/)
+		{
+			if(/\@topic\s+(.*)$/)
+			{
+				my $topic = $1;
+
+				$current_topic = $topic;
+				$help->{$topic}{topic} = $topic;
+			}
+			else
+			{
+				warn "[help database, line $.] topic doesn't have a value.\n";
+			}
+			next;
+		}
+
+		if(/\@keywords/i)
+		{
+			if(/\@keywords\s+([\w\s*,]+)$/)
+			{
+				my @keywords = split(/,/, $1);
+
+				while(my $key = shift(@keywords))
+				{
+					$key =~ s/^\s*//;
+					$key =~ s/\s*$//;
+
+					if(exists($help->{$current_topic}{keyword}))
+					{
+						push(@{$help->{$current_topic}{keyword}}, $key);
+					}
+					else
+					{
+						$help->{$current_topic}{keyword} = [ $key ];
+					}
+				}
+			}
+			elsif(/\@keywords\s+(\w+)$/)
+			{
+				$help->{$current_topic}{keyword} = [ $1 ];
+			}
+			else
+			{
+				warn "[help database, line $.] keywords value incorrect\n";
+			}
+			next;
+		}
+
+		if(/\@seealso/i)
+		{
+			if(/\@seealso\s+([\.\w\s*,]+)$/)
+			{
+				my @seealso = split(/,/, $1);
+
+				while(my $key = shift(@seealso))
+				{
+					$key =~ s/^\s*//;
+					$key =~ s/\s*$//;
+
+					if(exists($help->{$current_topic}{seealso}))
+					{
+						push(@{$help->{$current_topic}{seealso}}, $key);
+					}
+					else
+					{
+						$help->{$current_topic}{seealso} = [ $key ];
+					}
+				}
+			}
+			elsif(/\@level\s+(\w+)$/)
+			{
+				my %level = (	'none',		=> 0,
+						'su'		=> SU,
+						'builder',	=> BUILDER,
+						'asu',		=> ASU,
+						'lower_admin',	=> LOWER_ADMIN,
+						'admin',	=> ADMIN,
+					);
+
+				if(exists($level{$1}))
+				{
+					$help->{$current_topic}{level} = $level{$1};
+				}
+				else
+				{
+					warn "[help database, line $.]: level doesn't exist.\n";
+				}
+			}
+			elsif(/\@seealso\s+(\w+)$/)
+			{
+				$help->{$current_topic}{seealso} = [ $1 ];
+			}
+			else
+			{
+				warn "[help database, line $.] seealso value incorrect\n";
+			}
+			next;
+		}
+
+		$help->{$current_topic}{text} .= $_ if(length($current_topic));
+		next;
+	}
+	close(HELP);
+	Makelog('boot', 'Loaded help files');
+	return (0);
+}
+
+sub Initiate::Files
+{
+	my @file = <lib/files/*>;
+
+	foreach my $file (@file)
+	{
+		my $base = $file;
+
+		$base =~ s/lib\/files\///;
+		open(FILE, "<$file") or next;
+		while(<FILE>)
+		{
+			$config->{file}{$base} .= $_;
+		}
+		close(FILE);
+	}
+	Makelog('boot', "Loaded files from lib/files/");
+	return (0);
+}
+
+sub Initiate::Commands
+{
+	$command{'@'}{func}			= \&Command::Redo;
+	$command{'@'}{priv}			= NEWBIE;
+
+	$command{'?'}{func}			= \&Command::Help;
+	$command{'?'}{priv}			= NEWBIE;
+
+	$command{'+'}{func}			= \&Command::Communication::Echo;
+	$command{'+'}{priv}			= RESIDENT;
+
+	$command{'\''}{func}			= \&Command::Communication::Say;
+	$command{'\''}{priv}			= NEWBIE;
+
+	$command{'`'}{func}			= \&Command::Communication::Say;
+	$command{'`'}{priv}			= NEWBIE;
+
+	$command{'"'}{func}			= \&Command::Communication::Say;
+	$command{'"'}{priv}			= NEWBIE;
+
+	$command{';'}{func}			= \&Command::Communication::Emote;
+	$command{';'}{priv}			= NEWBIE;
+
+	$command{':'}{func}			= \&Command::Communication::Emote;
+	$command{':'}{priv}			= NEWBIE;
+
+	$command{'['}{func}			= \&Command::Communication::ReplyRemote;
+	$command{'['}{priv}			= NEWBIE;
+
+	$command{']'}{func}			= \&Command::Communication::ReplyTell;
+	$command{']'}{priv}			= NEWBIE;
+
+	$command{'.'}{func}			= \&Command::Communication::Tell;
+	$command{'.'}{priv}			= NEWBIE;
+
+	$command{'>'}{func}			= \&Command::Communication::Tell;
+	$command{'>'}{priv}			= NEWBIE;
+
+	$command{','}{func}			= \&Command::Communication::Remote;
+	$command{','}{priv}			= NEWBIE;
+
+	$command{'<'}{func}			= \&Command::Communication::Remote;
+	$command{'<'}{priv}			= NEWBIE;
+
+	$command{'~'}{func}			= \&Command::Communication::Think;
+	$command{'~'}{priv}			= NEWBIE;
+
+	$command{'a?'}{func}			= \&Command::Admin::Who;
+	$command{'a?'}{priv}			= LOWER_ADMIN;
+
+	$command{'a~'}{func}			= \&Command::Admin::Think;
+	$command{'a~'}{priv}			= LOWER_ADMIN;
+
+	$command{'a:'}{func}			= \&Command::Admin::Emote;
+	$command{'a:'}{priv}			= LOWER_ADMIN;
+
+	$command{'a;'}{func}			= \&Command::Admin::Emote;
+	$command{'a;'}{priv}			= LOWER_ADMIN;
+
+	$command{'a"'}{func}			= \&Command::Admin::Say;
+	$command{'a"'}{priv}			= LOWER_ADMIN;
+
+	$command{'a`'}{func}			= \&Command::Admin::Say;
+	$command{'a`'}{priv}			= LOWER_ADMIN;
+
+	$command{'a\''}{func}			= \&Command::Admin::Say;
+	$command{'a\''}{priv}			= LOWER_ADMIN;
+
+	$command{'ae'}{func}			= \&Command::Admin::Emote;
+	$command{'ae'}{priv}			= LOWER_ADMIN;
+
+	$command{'at'}{func}			= \&Command::Admin::Think;
+	$command{'at'}{priv}			= LOWER_ADMIN;
+
+	$command{'aw'}{func}			= \&Command::Admin::Who;
+	$command{'aw'}{priv}			= LOWER_ADMIN;
+
+	$command{'ad'}{func}			= \&Command::Admin::Say;
+	$command{'ad'}{priv}			= LOWER_ADMIN;
+
+	$command{'autoterm'}{func}		= \&Command::AutoTerm;
+	$command{'autoterm'}{priv}		= NEWBIE;
+
+	$command{'c*'}{func}			= \&Command::Custom::List;
+	$command{'c*'}{priv}			= RESIDENT;
+
+	$command{'c~'}{func}			= \&Command::Custom::Think;
+	$command{'c~'}{priv}			= RESIDENT;
+
+	$command{'c;'}{func}			= \&Command::Custom::Emote;
+	$command{'c;'}{priv}			= RESIDENT;
+
+	$command{'c:'}{func}			= \&Command::Custom::Emote;
+	$command{'c:'}{priv}			= RESIDENT;
+
+	$command{'c"'}{func}			= \&Command::Custom::Say;
+	$command{'c"'}{priv}			= RESIDENT;
+
+	$command{'c\''}{func}			= \&Command::Custom::Say;
+	$command{'c\''}{priv}			= RESIDENT;
+
+	$command{'c='}{func}			= \&Command::Custom::Join;
+	$command{'c='}{priv}			= RESIDENT;
+
+	$command{'c`'}{func}			= \&Command::Custom::Say;
+	$command{'c`'}{priv}			= RESIDENT;
+
+	$command{'c?'}{func}			= \&Command::Custom::Who;
+	$command{'c?'}{priv}			= RESIDENT;
+
+	$command{'cc'}{func}			= \&Command::Custom::Join;
+	$command{'cc'}{priv}			= RESIDENT;
+
+	$command{'ce'}{func}			= \&Command::Custom::Emote;
+	$command{'ce'}{priv}			= RESIDENT;
+
+	$command{'commands'}{func}		= \&Command::Commands;
+	$command{'commands'}{priv}		= NEWBIE;
+
+	$command{'color'}{func}			= \&Command::Toggle::Color;
+	$command{'color'}{priv}			= NEWBIE;
+
+	$command{'colour'}{func}		= \&Command::Toggle::Color;
+	$command{'colour'}{priv}		= NEWBIE;
+
+	$command{'colorlist'}{func}		= \&Command::List::Color;
+	$command{'colorlist'}{priv}		= RESIDENT;
+
+	$command{'colourlist'}{func}		= \&Command::List::Color;
+	$command{'colourlist'}{priv}		= RESIDENT;
+
+	$command{'cs'}{func}			= \&Command::Custom::Say;
+	$command{'cs'}{priv}			= RESIDENT;
+
+	$command{'cset'}{func}			= \&Command::Change::Color;
+	$command{'cset'}{priv}			= RESIDENT;
+
+	$command{'ct'}{func}			= \&Command::Custom::Think;
+	$command{'ct'}{priv}			= RESIDENT;
+
+	$command{'cl'}{func}			= \&Command::Custom::List;
+	$command{'cl'}{priv}			= RESIDENT;
+
+	$command{'cw'}{func}			= \&Command::Custom::Who;
+	$command{'cw'}{priv}			= RESIDENT;
+
+	$command{'d'}{func}			= \&Command::Room::Down;
+	$command{'d'}{priv}			= NEWBIE;
+
+	$command{'e'}{func}			= \&Command::Room::East;
+	$command{'e'}{priv}			= NEWBIE;
+
+	$command{'echo'}{func}			= \&Command::Communication::Echo;
+	$command{'echo'}{priv}			= RESIDENT;
+
+	$command{'emote'}{func}			= \&Command::Communication::Emote;
+	$command{'emote'}{priv}			= NEWBIE;
+
+	$command{'examine'}{func}		= \&Command::Examine;
+	$command{'examine'}{priv}		= NEWBIE;
+
+	$command{'fwho'}{func}			= \&Command::List::Friends;
+	$command{'fwho'}{priv}			= RESIDENT;
+
+	$command{'go'}{func}			= \&Command::Room::Go;
+	$command{'go'}{priv}			= BUILDER;
+
+	$command{'grant'}{func}			= \&Command::Admin::Grant;
+	$command{'grant'}{priv}			= ADMIN;
+
+	$command{'help'}{func}			= \&Command::Help;
+	$command{'help'}{priv}			= NEWBIE;
+
+	$command{'l'}{func}			= \&Command::Room::Look;
+	$command{'l'}{priv}			= NEWBIE;
+
+	$command{'list'}{func}			= \&Command::List::List;
+	$command{'list'}{priv}			= RESIDENT;
+
+	$command{'look'}{func}			= \&Command::Room::Look;
+	$command{'look'}{priv}			= NEWBIE;
+
+	$command{'lset'}{func}			= \&Command::List::Set;
+	$command{'lset'}{priv}			= RESIDENT;
+
+	$command{'lsu'}{func}			= \&Command::Lsu;
+	$command{'lsu'}{priv}			= NEWBIE;
+
+	$command{'man'}{func}			= \&Command::Help;
+	$command{'man'}{priv}			= NEWBIE;
+
+	$command{'n'}{func}			= \&Command::Room::North;
+	$command{'n'}{priv}			= NEWBIE;
+
+	$command{'object'}{func}		= \&Command::Object;
+	$command{'object'}{priv}		= SU;
+
+	$command{'password'}{func}		= \&Command::Password;
+	$command{'password'}{priv}		= RESIDENT;
+
+	$command{'privs'}{func}			= \&Command::List::Privs;
+	$command{'privs'}{priv}			= RESIDENT;
+
+	$command{'ps'}{func}			= \&Command::Admin::Ps;
+	$command{'ps'}{priv}			= LOWER_ADMIN;
+
+	$command{'quit'}{func}			= \&Command::Quit;
+	$command{'quit'}{priv}			= NEWBIE;
+
+	$command{'rcreate'}{func}		= \&Command::Room::Create;
+	$command{'rcreate'}{priv}		= BUILDER;
+
+	$command{'remote'}{func}		= \&Command::Communication::Remote;
+	$command{'remote'}{priv}		= NEWBIE;
+
+	$command{'reload'}{func}		= \&Command::Admin::Reload;
+	$command{'reload'}{priv}		= LOWER_ADMIN;
+
+	$command{'remove'}{func}		= \&Command::Admin::Remove;
+	$command{'remove'}{priv}		= ADMIN;
+
+	$command{'reply'}{func}			= \&Command::Communication::ReplyTell;
+	$command{'reply'}{priv}			= NEWBIE;
+
+	$command{'release'}{func}		= \&Command::Admin::Release;
+	$command{'release'}{priv}		= ADMIN;
+
+	$command{'res'}{func}			= \&Command::Resident;
+	$command{'res'}{priv}			= SU;
+
+	$command{'resident'}{func}		= \&Command::Resident;
+	$command{'resident'}{priv}		= SU;
+
+	$command{'rload'}{func}			= \&Command::Room::Load;
+	$command{'rload'}{priv}			= BUILDER;
+
+	$command{'rset'}{func}			= \&Command::Room::Set;
+	$command{'rset'}{priv}			= BUILDER;
+
+	$command{'rthink'}{func}		= \&Command::Communication::Rthink;
+	$command{'rthink'}{priv}		= NEWBIE;
+
+	$command{'rlist'}{func}			= \&Command::Room::List;
+	$command{'rlist'}{priv}			= BUILDER;
+
+	$command{'runload'}{func}		= \&Command::Room::Unload;
+	$command{'runload'}{priv}		= BUILDER;
+
+	$command{'rsave'}{func}			= \&Command::Room::Save;
+	$command{'rsave'}{priv}			= BUILDER;
+
+	$command{'s'}{func}			= \&Command::Room::South;
+	$command{'s'}{priv}			= NEWBIE;
+
+	$command{'s?'}{func}			= \&Command::SU::Who;
+	$command{'s?'}{priv}			= PSU;
+
+	$command{'s:'}{func}			= \&Command::SU::Emote;
+	$command{'s:'}{priv}			= PSU;
+
+	$command{'s;'}{func}			= \&Command::SU::Emote;
+	$command{'s;'}{priv}			= PSU;
+
+	$command{'s`'}{func}			= \&Command::SU::Say;
+	$command{'s`'}{priv}			= PSU;
+
+	$command{'s"'}{func}			= \&Command::SU::Say;
+	$command{'s"'}{priv}			= PSU;
+
+	$command{'s~'}{func}			= \&Command::SU::Think;
+	$command{'s~'}{priv}			= PSU;
+
+	$command{'s\''}{func}			= \&Command::SU::Say;
+	$command{'s\''}{priv}			= PSU;
+
+	$command{'say'}{func}			= \&Command::Communication::Say;
+	$command{'say'}{priv}			= NEWBIE;
+
+	$command{'save'}{func}			= \&Command::Save;
+	$command{'save'}{priv}			= RESIDENT;
+
+	$command{'se'}{func}			= \&Command::SU::Emote;
+	$command{'se'}{priv}			= PSU;
+
+	$command{'st'}{func}			= \&Command::SU::Think;
+	$command{'st'}{priv}			= PSU;
+
+	$command{'sw'}{func}			= \&Command::SU::Who;
+	$command{'sw'}{priv}			= PSU;
+
+	$command{'swho'}{func}			= \&Command::Swho;
+	$command{'swho'}{priv}			= NEWBIE;
+
+	$command{'su'}{func}			= \&Command::SU::Say;
+	$command{'su'}{priv}			= PSU;
+
+	$command{'tell'}{func}			= \&Command::Communication::Tell;
+	$command{'tell'}{priv}			= NEWBIE;
+
+	$command{'think'}{func}			= \&Command::Communication::Think;
+	$command{'think'}{priv}			= NEWBIE;
+
+	$command{'time'}{func}			= \&Command::Time;
+	$command{'time'}{priv}			= NEWBIE;
+
+	$command{'version'}{func}		= \&Command::Version;
+	$command{'version'}{priv}		= NEWBIE;
+
+	$command{'w'}{func}			= \&Command::Room::West;
+	$command{'w'}{priv}			= NEWBIE;
+
+	$command{'ww'}{func}			= \&Command::WW;
+	$command{'ww'}{priv}			= NEWBIE;
+
+	$command{'who'}{func}			= \&Command::Who;
+	$command{'who'}{priv}			= NEWBIE;
+
+	$command{'x'}{func}		= \&Command::Examine;
+	$command{'x'}{priv}		= NEWBIE;
+
+	$command{'u'}{func}			= \&Command::Room::Up;
+	$command{'u'}{priv}			= NEWBIE;
+
+	$command{'zc'}{func}			= \&Command::Zone::Create;
+	$command{'zc'}{priv}			= ADMIN;
+
+	$command{'zedit'}{func}			= \&Command::Zone::Edit;
+	$command{'zedit'}{priv}			= ADMIN;
+
+	$command{'zload'}{func}			= \&Command::Zone::Load;
+	$command{'zload'}{priv}			= ADMIN;
+
+	$command{'zlist'}{func}			= \&Command::Zone::List;
+	$command{'zlist'}{priv}			= ADMIN;
+
+	$command{'zsave'}{func}			= \&Command::Zone::Save;
+	$command{'zsave'}{priv}			= ADMIN;
+
+	$command{'zset'}{func}			= \&Command::Zone::Set;
+	$command{'zset'}{priv}			= ADMIN;
+
+	$command{'zstat'}{func}			= \&Command::Zone::Stat;
+	$command{'zstat'}{priv}			= ADMIN;
+
+	$command{'zunload'}{func}		= \&Command::Zone::Unload;
+	$command{'zunload'}{priv}		= ADMIN;
+
+
+	Makelog('boot', "Loaded command structure.");
+	return (0);
+}
+
+sub Initiate::Rooms
+{
+	my @rooms;
+
+	if(exists($config->{'zone.autoload'}))
+	{
+		my @zones = split(/,/, $config->{'zone.autoload'});
+
+		foreach my $zone (@zones)
+		{
+			$zone =~ s/^\s*//;
+			$zone =~ s/\s*$//;
+			$zone = int($zone);
+
+			my $sth = $dbh->prepare("SELECT id FROM room WHERE room.zone=$zone");
+
+			$sth->execute;
+
+			while(my $ref = $sth->fetchrow_arrayref)
+			{
+				push(@rooms, $ref->[0]);
+			}
+
+			$sth->finish;
+		}
+
+		while(scalar(@rooms))
+		{
+			my $r = shift(@rooms);
+			Room::Load($r);
+		}
+
+		return (0);
+	}
+	else
+	{
+		return (-1);
+	}
+}
+
+sub Initiate::Zones
+{
+	if(exists($config->{'zone.autoload'}))
+	{
+		my @zones = split(/,/, $config->{'zone.autoload'});
+
+		foreach my $zone (@zones)
+		{
+			$zone =~ s/^\s*//;
+			$zone =~ s/\s*$//;
+			$zone = int($zone);
+
+			Zone::Load($zone) == -1 ?
+				Makelog('boot', "failed to load zone $zone!") :
+				Makelog('boot', "successfully loaded zone $zone");
+		}
+		return (0);
+	}
+	else
+	{
+		Makelog('boot', 'zone.autoload doesn\'t exist');
+		return (-1);
+	}
+}
+
+sub Initiate::Timer
+{
+	$SIG{'ALRM'} = \&Timer::Click;
+	alarm(1);
+	Makelog('boot', "Setup timer.  SIGALRM set to 1 second.");
+	return (0);
+}
+
+sub Initiate::Shutdown
+{
+	Makelog('shutdown', 'anteek down');
+	close(STDOUT);
+	close(STDERR);
+}
+
+sub Timer::Click
+{
+	alarm(1);
+
+	$config->{'uptime'}++;
+
+	$config->{'tune'}++;
+	if($config->{'tune'} == 2)
+	{
+		Timer::Click::Two();
+		$config->{'tune'} = 0;
+	}
+
+	foreach my $i (keys %{$player})
+	{
+		if(exists($player->{$i}{res_wait}))
+		{
+			$player->{$i}{res_wait}--;
+			if($player->{$i}{res_wait} == 0)
+			{
+				Player::Tell($i, "^HYou have been granted resideny.  Please use the `password' command to set a password, and don't forget to save.^N\n");
+				$player->{$i}{privs} |= RESIDENT;
+				$player->{$i}{privs} |= MAIL;
+				$player->{$i}{privs} |= NEWS;
+				$player->{$i}{privs} |= SESSION;
+				delete $player->{$i}{res_wait};
+				SU::Wall("-=> $player->{$i}{name} has been granted residency.\n");
+			}
+		}
+
+		$player->{$i}{total_login}++;
+		$player->{$i}{time_on}++;
+		$player->{$i}{idle}++;
+	}
+
+	return (0);
+}
+
+sub Timer::Click::Two
+{
+	foreach my $i (keys %{$player})
+	{
+		$player->{$i}{WHAT} = 'idle';
+	}
+	return (0);
+}
+
+sub Check::RE
+{
+	my $srch = shift;
+
+	return eval { "" =~ /$srch/; 1 } || -1;
+}
+
+sub Find::Player
+{
+	my $src = shift;
+	my $name = shift;
+	my $flag = shift;
+	my @error;
+	my %final;
+	my $match = 0;
+
+	$_ = $name;
+
+	if(/,/)
+	{
+		my @names = split(/,/, $name);
+		my @sync;
+
+		while(my $n = shift(@names))
+		{
+			if(Check::RE($n) == -1)
+			{
+				push(@sync, undef);
+				push(@error, "`$n' is an invalid regular expression.\n");
+			}
+			else
+			{
+				push(@sync, $n);
+			}
+		}
+
+		foreach my $n (@sync)
+		{
+			length($n) or next;
+			foreach my $p (keys %{$player})
+			{
+				$player->{$p}{state} & LOGGED_IN or next;
+				$_ = $player->{$p}{name};
+				if($player->{$p}{name} eq $n)
+				{
+					if($p == $src && $flag != 1)
+					{
+						push(@error, "`$player->{$src}{name}' is you, spoon!!\n");
+						$match = 2;
+						goto NEXT_N;
+					}
+
+					foreach my $key (@{$player->{$p}{list_ignore}})
+					{
+						if($key == $player->{$src}{id})
+						{
+							push(@error, "$player->{$p}{name} is ignoring you.\n");
+							$match = 2;
+							goto NEXT_N;
+						}
+					}
+
+					foreach my $key (@{$player->{$p}{list_block}})
+					{
+						if($key == $player->{$src}{id})
+						{
+							push(@error, "$player->{$p}{name} is blocking you.\n");
+							$match = 2;
+							goto NEXT_N;
+						}
+					}
+
+					$final{$n} = $p;
+					$match = 1;
+					goto NEXT_N;
+				}
+				elsif(/^$n/i)
+				{
+					foreach my $key (@{$player->{$p}{list_ignore}})
+					{
+						if($key == $player->{$src}{id})
+						{
+							push(@error, "$player->{$p}{name} is ignoring you.\n");
+							$match = 2;
+							goto NEXT_N;
+						}
+					}
+
+					foreach my $key (@{$player->{$p}{list_block}})
+					{
+						if($key == $player->{$src}{id})
+						{
+							push(@error, "$player->{$p}{name} is blocking you.\n");
+							$match = 2;
+							goto NEXT_N;
+						}
+					}
+
+					if(exists($final{$n}))
+					{
+						ref($final{$n}) or $final{$n} = [ $final{$n} ];
+						push(@{$final{$n}}, $p);
+					}
+					else
+					{
+						$final{$n} = $p;
+					}
+
+					$match = 1;
+				}
+			}
+			NEXT_N:
+			if($match == 0)
+			{
+				push(@error, "Couldn't find anyone with the name of `$n'.\n");
+			}
+			else
+			{
+				$match = 0;
+			}
+		}
+
+		return (\%final, \@error);
+	}
+	else
+	{
+		if(Check::RE($name) == -1)
+		{
+			push(@error, "`$name' is an invalid regular expression.\n");
+			return(undef, \@error);
+		}
+
+		foreach my $p (keys %{$player})
+		{
+			$player->{$p}{state} & LOGGED_IN or next;
+			$_ = $player->{$p}{name};
+			if($player->{$p}{name} eq $name)
+			{
+				if($p == $src && $flag != 1)
+				{
+					push(@error, "`$player->{$src}{name}' is you, spoon!!\n");
+					$match = 2;
+					goto OVER;
+				}
+
+				foreach my $key (@{$player->{$p}{list_ignore}})
+				{
+					if($key == $player->{$src}{id})
+					{
+						push(@error, "$player->{$p}{name} is ignoring you.\n");
+						$match = 2;
+						goto OVER;
+					}
+				}
+
+				foreach my $key (@{$player->{$p}{list_block}})
+				{
+					if($key == $player->{$src}{id})
+					{
+						push(@error, "$player->{$p}{name} is blocking you.\n");
+						$match = 2;
+						goto OVER;
+					}
+				}
+
+				$final{$name} = $p;
+				$match = 1;
+				goto OVER;
+			}
+			elsif(/^$name/i)
+			{
+				foreach my $key (@{$player->{$p}{list_ignore}})
+				{
+					if($key == $player->{$src}{id})
+					{
+						push(@error, "$player->{$p}{name} is ignoring you.\n");
+						goto NEXT_SINGLE;
+						$match = 2;
+					}
+				}
+
+				foreach my $key (@{$player->{$p}{list_block}})
+				{
+					if($key == $player->{$src}{id})
+					{
+						push(@error, "$player->{$p}{name} is blocking you.\n");
+						goto NEXT_SINGLE;
+						$match = 2;
+					}
+				}
+
+				if(exists($final{$name}))
+				{
+					ref($final{$name}) or $final{$name} = [ $final{$name} ];
+					push(@{$final{$name}}, $p);
+				}
+				else
+				{
+					$final{$name} = $p;
+				}
+				$match = 1;
+			}
+			NEXT_SINGLE:
+		}
+		OVER:
+
+		if($match == 0)
+		{
+			push(@error, "Couldn't find anyone with the name of `$name'.\n");
+		}
+
+		return (\%final, \@error);
+	}
+}
+
+sub Make::Resident::Total
+{
+	my $sth = $dbh->prepare("SELECT COUNT(id) FROM player");
+
+	$sth->execute;
+
+	while(my $ref = $sth->fetchrow_arrayref)
+	{
+		return ($ref->[0]);
+	}
+
+	return (-1);
+}
+
+sub Make::Word::Number
+{
+	my $n = shift;
+	my $str;
+
+	$n = int($n);
+
+	$n or return ('none');
+	$n <= 1000 or return ($n);
+
+	my ($hundreds, $tens, $units);
+
+	if($n < 0)
+	{
+		$n = abs($n);
+		$str .= 'negative';
+	}
+
+	$hundreds = int($n / 100);
+	$tens = int(($n / 10) % 10);
+	$units = int($n % 10);
+
+	if($hundreds)
+	{
+		$str .= "$word_units[$hundreds] hundred";
+	}
+
+	if($hundreds && ($units || $tens))
+	{
+		$str .= ' and ';
+	}
+
+	if($tens && $tens != 1)
+	{
+		$str .= "$word_tens[$tens]";
+	}
+
+	if($tens != 1 && $tens && $units)
+	{
+		$str .= ' ';
+	}
+
+	if($units && $tens != 1)
+	{
+		$str .= "$word_units[$units]";
+	}
+
+	if($tens == 1)
+	{
+		$str .= "$word_teens[($n % 100) - 10]";
+	}
+
+	return ($str);
+}
+sub Make::Word::Time
+{
+	my $t = shift;
+	my $str;
+
+	length($t) or return ('no time at all');
+
+	my ($days, $hours, $minutes, $seconds);
+
+	if($t < 0)
+	{
+		$t = abs($t);
+		$str .= 'negative ';
+	}
+
+	$days = int($t / 86400);
+	$hours = int(($t / 3600) % 24);
+	$minutes = int(($t / 60) % 60);
+	$seconds = int($t % 60);
+
+	if($days)
+	{
+		$str .= "$days day";
+		$str .= 's' if($days != 1);
+		$str .= ', ' if($hours || $minutes || $seconds)
+	}
+
+	if($hours)
+	{
+		$str .= "$hours hour";
+		$str .= 's' if($hours != 1);
+		$str .= ', ' if($minutes && $seconds);
+		$str .= ' and ' if(($minutes && !$seconds) || (!$minutes && $seconds));
+	}
+
+	if($minutes)
+	{
+		$str .= "$minutes minute";
+		$str .= 's' if($minutes != 1);
+		$str .= ' and ' if($seconds);
+	}
+
+	if($seconds)
+	{
+		$str .= "$seconds second";
+		$str .= 's' if($seconds != 1);
+	}
+
+	return ($str);
+}
+
+sub Make::String
+{
+	my $str = shift;
+
+	$_ = $str;
+	/(.)$/;
+	length($1) or return ('tells', 'tell');
+	if(length($str) > 100) { return ('lectures to', 'lecture to'); }
+	elsif(length($str) > 75) { return ('explains to', 'explain to'); }
+	elsif(length($str) > 50) { return ('tells', 'tell'); }
+	elsif(length($str) > 20) { return ('mentions to', 'mention to'); }
+	elsif(length($str) > 10) { return ('mutters to', 'mutter to'); }
+	elsif($1 eq "?") { return ('asks of', 'ask'); }
+	elsif($1 eq "!") { return ('exclaims to', 'exclaim to'); }
+	else { return ('tells', 'tell'); }
+}
+
+sub Make::String::Public
+{
+	my $str = shift;
+
+	$_ = $str;
+	/(.)$/;
+	length($1) or return ('says', 'say');
+	if(length($str) > 100) { return ('lectures', 'lecture'); }
+	elsif(length($str) > 75) { return ('explains', 'explain'); }
+	elsif($1 eq "?") { return ('asks', 'ask'); }
+	elsif($1 eq "!") { return ('exclaims', 'exclaim'); }
+	else { return ('says', 'say'); }
+}
+
+sub Help::Find::Topic
+{
+	my $i = shift;
+	my $topic = shift;
+	my %pre;
+	my @list;
+
+	if(Check::RE($topic) == -1)
+	{
+		return (-1);
+	}
+
+	foreach my $key (keys %{$help})
+	{
+		$player->{$i}{privs} >= $help->{$key}{level} or next;
+		$_ = $key;
+
+		/^$topic/ and $pre{$key} = 1;
+		foreach my $word (@{$help->{$key}{keyword}})
+		{
+			$_ = $word;
+			/^$topic/ and $pre{$key} = 1;
+		}
+	}
+
+	@list = sort(keys(%pre));
+	scalar(@list) and return (\@list);
+	return (-1);
+}
+
+sub Player::Center
+{
+	my $i = shift;
+	my $size = 78;
+	my $ch = shift;
+	my $str = join('', @_);
+	my $dots;
+	my $dots2;
+	my $len;
+	my $len2;
+
+	$len = int(((($size - 5) - (length($str) + 2)) / 2));
+	$len2 = $len;
+
+	if($len * 2 != (($size - 5) - (length($str))))
+	{
+		$len2++;
+	}
+
+	$dots = $ch x $len;
+	$dots2 = $ch x $len2;
+	Player::Tell($i, "$dots $str $dots2\n");
+}
+
+sub Player::Banner
+{
+	my $i = shift;
+	my $len = shift;
+	my $ch = shift;
+	my $str = join('', @_);
+	#my ($i, $len, $ch, $str) = @_;
+	my $dots;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	$len > 0 or $len = ($socket->{$i}{x} - 7);
+
+	if($str)
+	{
+		$dots = $ch x ($len-(length($str)+4));
+		Player::Tell($i, "--[^H$str^N]$dots\n");
+	}
+	else
+	{
+		$dots = $ch x $len;
+		Player::Tell($i, "$dots\n");
+	}
+
+	return (0);
+}
+
+sub Player::Tell
+{
+	my $i = shift;
+	my $str = join('', @_);
+
+	if(Player::Check::Structure($i) == 0)
+	{
+		Socket::Process::Output($i, $str);
+		return (0);
+	}
+	else
+	{
+		return (-1);
+	}
+}
+
+sub Player::Prompt
+{
+	my $i = shift;
+	my $str = shift;
+
+	$str .= " \377\371";
+	Player::Tell($i, $str);
+}
+
+sub Player::Get::Rank
+{
+	my $i = shift;
+
+	return ('adm') if($player->{$i}{privs} & ADMIN);
+	return ('cdr') if($player->{$i}{privs} & CODER);
+	return ('adm') if($player->{$i}{privs} & LOWER_ADMIN);
+	return ('su') if($player->{$i}{privs} & SU);
+	return ('bldr') if($player->{$i}{privs} & BUILDER);
+	return ('res') if($player->{$i}{privs} & RESIDENT);
+	return ('newb');
+}
+
+sub Player::Get::TimeOn
+{
+	my $i = shift;
+	my $t = $player->{$i}{time_on};
+
+	my $days = int($t / 86400);
+	my $hours = int(($t / 3600) % 24);
+	my $minutes = int(($t / 60) % 60);
+
+	return (sprintf("%.2dd%.2dh", $days, $hours)) if($days);
+	return (sprintf("%.2dh%.2dm", $hours, $minutes));
+}
+
+sub Player::Get::Idle
+{
+	my $i = shift;
+	my $t = $player->{$i}{idle};
+
+	my $days = int($t / 86400);
+	my $hours = int(($t / 3600) % 24);
+	my $minutes = int(($t / 60) % 60);
+	my $seconds = int($t % 60);
+
+	if($days)
+	{
+		return (sprintf("%dd", $days));
+	}
+	elsif($hours)
+	{
+		return (sprintf("%dh", $hours));
+	}
+	elsif($minutes)
+	{
+		return (sprintf("%ds", $minutes));
+	}
+	elsif($seconds)
+	{
+		return (sprintf("%ds", $seconds));
+	}
+	else
+	{
+		return ('0s');
+	}
+}
+
+sub Player::Get::Socket
+{
+	my $i = shift;
+
+	return (sprintf("%dfd", $i));
+}
+
+sub Player::Get::Function
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	$player->{$i}{WHAT} = ((caller 1)[3]);
+	return (0);
+}
+
+sub Player::Get::NameById
+{
+	my $id = shift;
+
+	my $sth = $dbh->prepare("SELECT name FROM player WHERE id=$id");
+
+	$sth->execute;
+
+	while(my $ref = $sth->fetchrow_hashref)
+	{
+		foreach my $key (keys %{$ref})
+		{
+			if($key eq 'name')
+			{
+				return $$ref{$key};
+			}
+		}
+	}
+
+	$sth->finish;
+
+	return (-1);
+}
+
+sub Player::Check::Exists
+{
+	my $name = shift;
+
+	my $sth = $dbh->prepare("SELECT name FROM player WHERE name='$name'");
+	my $ret = $sth->execute;
+
+	$sth->finish;
+	$ret eq '0E0' ? return (-1) : return (0);
+}
+
+sub Player::Check::Name
+{
+	my $i = shift;
+
+	$_ = shift;
+
+	s/^\s*//;
+	s/\s*$//;
+	chomp;
+
+	foreach my $p (keys %{$player})
+	{
+		if($player->{$p}{name} eq $_ && $p != $i)
+		{
+			Player::Tell($i, "That name is already being used by someone else, please try again.\n");
+			return (-1);
+		}
+	}
+
+	if(/\d/)
+	{
+		Player::Tell($i, "Sorry, I cannot allow digits within your name, please try again.\n");
+		return (-1);
+	}
+
+	if(/[^\w]/)
+	{
+		Player::Tell($i, "Sorry, I cannot allow punctuation within your name, please try again.\n");
+		return (-1);
+	}
+
+	if(length($_) < 2 || length($_) > 21)
+	{
+		Player::Tell($i, "Names must be between 2 and 20 characters, please try again.\n");
+		return (-1);
+	}
+
+	if(/^who/i || /^quit/i)
+	{
+		Player::Tell($i, "You have chosen a reservered name, please try again.\n");
+		return (-1);
+	}
+
+	return (0);
+}
+
+sub Player::Check::Structure
+{
+	my $i = shift;
+
+	if(exists($socket->{$i}))
+	{
+		if(exists($player->{$i}))
+		{
+			return (0);
+		}
+		else
+		{
+			Makelog('socket', "Found stale socket without a player structure, disconnecting.");
+			$socket->{$i}{state} |= DISCONNECT;
+			return (-1);
+		}
+	}
+	else
+	{
+		if(exists($player->{$i}))
+		{
+			Makelog('zombie', "Found a stale player without a socket reference - turning into a zombie.");
+			$player->{$i}{state} |= ZOMBIE;
+			return (-1);
+		}
+		else
+		{
+			return (-1);
+		}
+	}
+}
+
+sub Player::DoPrompt
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	if($player->{$i}{state} & PROMPT)
+	{
+		Player::Prompt($i, $player->{$i}{PS1});
+	}
+	return (0);
+}
+
+sub Player::Handle::New
+{
+	my $i = shift;
+
+	$i >= 1 or return (-1);
+
+	$player->{$i}{state} |= ALPHA;
+	my @tmp = gmtime;
+	$player->{$i}{start} = [ @tmp ];
+
+	Player::Get::Function($i);
+	Player::Tell($i, $config->{file}{issue});
+	Player::Tell($i, "Use the name 'new' to create a new character\n");
+	Player::Prompt($i, 'prancing pony login:');
+	$player->{$i}{func} = \&Login::Get::Login;
+	return (0);
+}
+
+sub Player::Display::MOTD
+{
+	my $i = shift;
+
+	Player::Tell($i, "\n");
+
+	$player->{$i}{channel_normal}	= NORMAL;
+	$player->{$i}{room} = 0;
+	$player->{$i}{ww} > 20 or $player->{$i}{ww} = 78;
+	$socket->{$i}{x} = $player->{$i}{ww} unless($player->{$i}{flags} & USE_AUTO_TERM);
+	Command::Room::Look($i);
+
+	Player::Get::Function($i);
+	if($socket->{$i}{state} & TELOPT && $player->{$i}{flags} & USE_AUTO_TERM)
+	{
+		Player::Tell($i, "\n[Automatically detected terminal size: $socket->{$i}{x}x$socket->{$i}{y}]\n");
+	}
+	else
+	{
+		Player::Tell($i, "\n[Unable to automatically detect your terminal size, using default $player->{$i}{ww}]\n");
+	}
+
+	Player::Tell($i, "^HWelcome to $config->{'talker.name'}, $player->{$i}{name}!^N\n");
+
+	$player->{$i}{state} &= ~ALPHA;
+	$player->{$i}{state} |= LOGGED_IN;
+	$player->{$i}{state} |= PROMPT;
+	delete $player->{$i}{func};
+
+	Room::Tell($player->{$i}{room}, $i, "% $player->{$i}{name} $player->{$i}{connectmsg}\n");
+	Player::Inform($i, INF_CONNECT);
+	return (0);
+}
+
+sub Player::Setup::Newbie
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+	$player->{$i}{name} = $player->{$i}{tmp};
+	delete $player->{$i}{tmp};
+
+	$player->{$i}{title} = 'the newbie, so please treat me nicely.';
+	$player->{$i}{groundstring} = "$player->{$i}{name} stands here.";
+	$player->{$i}{disconnectmsg} = 'leaves, but will be back shortly!';
+	$player->{$i}{connectmsg} = 'joins the stockade!';
+	$player->{$i}{entermsg} = 'rushs in!';
+	$player->{$i}{reconnectmsg} = 'shimmers slightly';
+	$player->{$i}{description} = 'One day I\'ll learn how to change this ;)';
+	$player->{$i}{plan} = 'One day I\'ll learn how to change this ;)';
+	$player->{$i}{PS1} = '->';
+	$player->{$i}{PS2} = '>';
+	$player->{$i}{prefix} = '';
+
+	$player->{$i}{channel_room}	= CYAN;
+	$player->{$i}{channel_shout}	= BROWN;
+	$player->{$i}{channel_tell}	= LT_RED;
+	$player->{$i}{channel_friend}	= LT_GREEN;
+	$player->{$i}{channel_echo}	= CYAN;
+	$player->{$i}{channel_session}	= CYAN;
+	$player->{$i}{channel_su}	= YELLOW;
+	$player->{$i}{channel_admin}	= LT_CYAN;
+	$player->{$i}{channel_custom}	= LT_MAGENTA;
+	$player->{$i}{channel_normal}	= NORMAL;
+	$player->{$i}{channel_hilite}	= BOLD;
+
+	$player->{$i}{list_bar} = [ ];
+	$player->{$i}{list_beep} = [ ];
+	$player->{$i}{list_block} = [ ];
+	$player->{$i}{list_friend} = [ ];
+	$player->{$i}{list_grab} = [ ];
+	$player->{$i}{list_ignore} = [ ];
+	$player->{$i}{list_inform} = [ ];
+	$player->{$i}{list_invite} = [ ];
+	$player->{$i}{list_mblock} = [ ];
+	$player->{$i}{list_noisy} = [ ];
+
+	$player->{$i}{ww} = 78;
+	$player->{$i}{flags} = 0;
+	$player->{$i}{privs} |= NEWBIE;
+	$player->{$i}{gender} |= MALE;
+	return (0);
+}
+
+sub Player::Get::HeShe
+{
+	my $i = shift;
+
+	$player->{$i}{gender} & MALE ? return 'he' : return 'she';
+}
+
+sub Player::Get::HisHer
+{
+	my $i = shift;
+
+	$player->{$i}{gender} & MALE ? return 'his' : return 'her';
+}
+
+sub Player::Get::Id
+{
+	my $name = shift;
+	my %g;
+
+	my $sth = $dbh->prepare("SELECT id FROM player WHERE name='$name'");
+
+	$sth->execute;
+
+	while(my $ref = $sth->fetchrow_hashref)
+	{
+		foreach my $key (keys %{$ref})
+		{
+			$g{$key} = $$ref{$key};
+		}
+	}
+
+	$sth->finish;
+
+	exists($g{id}) and return ($g{id});
+	return (-1);
+}
+
+sub Player::Save::List
+{
+	my $i = shift;
+	my $r;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	exists($player->{$i}{id}) or return (0);
+
+	my @list = qw(list_bar list_beep list_block list_friend list_grab list_ignore list_inform list_invite list_mblock list_noisy);
+	my $id = Player::Get::Id($player->{$i}{name});
+
+	while(my $table = shift(@list))
+	{
+		DBI::Do("DELETE FROM $table WHERE id=$player->{$i}{id}");
+
+		foreach my $sub_id (@{$player->{$i}{$table}})
+		{
+			$r += DBI::Do("INSERT into $table VALUES($player->{$i}{id}, $sub_id)");
+		}
+	}
+
+	return ($r);
+}
+
+sub Player::Load::List
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	my @list = qw(list_bar list_beep list_block list_friend list_grab list_ignore list_inform list_invite list_mblock list_noisy);
+	my $id = Player::Get::Id($player->{$i}{name});
+
+	while(my $table = shift(@list))
+	{
+		my @tmp;
+		my $sth = $dbh->prepare("SELECT name from $table WHERE id=$id");
+
+		$sth->execute;
+
+		while(my $ref = $sth->fetchrow_arrayref)
+		{
+			push(@tmp, $ref->[0]);
+		}
+
+		$sth->finish;
+
+		$player->{$i}{$table} = \@tmp;
+	}
+
+	return (0);
+}
+
+sub Player::Load::Super
+{
+	my $i = shift;
+	my %g;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	my $id = Player::Get::Id($player->{$i}{name});
+	my $sth = $dbh->prepare("SELECT * from superplayer WHERE id=$id");
+
+	$sth->execute;
+
+	while(my $ref = $sth->fetchrow_hashref)
+	{
+		foreach my $key (keys %{$ref})
+		{
+			$g{$key} = $$ref{$key};
+		}
+	}
+
+	$sth->finish;
+
+	while((my $k, my $v) = each (%g))
+	{
+		$player->{$i}{$k} = $v;
+	}
+
+	return (Player::Load::List($i));
+}
+
+sub Player::Load
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	my $sth = $dbh->prepare("SELECT * from player WHERE name='$player->{$i}{name}'");
+
+	$sth->execute;
+
+	while(my $ref = $sth->fetchrow_hashref)
+	{
+		foreach my $key (keys %{$ref})
+		{
+			$player->{$i}{$key} = $$ref{$key};
+		}
+	}
+
+	$sth->finish;
+
+	Player::Load::Super($i);
+	return (0);
+}
+
+sub Player::Save
+{
+	my $i = shift;
+	my $r;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	$r += DBI::Do("INSERT into player (id, name) values(NULL, ?)", $player->{$i}{name});
+
+	my $id = Player::Get::Id($player->{$i}{name});
+
+	$r += DBI::Do("INSERT into superplayer (id) values($id)");
+
+	$r += Player::Update($i);
+	return ($r);
+}
+
+sub Player::Update
+{
+	my $i = shift;
+	my $r;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	$r += DBI::Do("UPDATE player SET password=password(?) WHERE name='$player->{$i}{name}'", $player->{$i}{password});
+	$r += DBI::Do("UPDATE player SET last_ip=? WHERE name='$player->{$i}{name}'", $socket->{$i}{ip});
+	$r += DBI::Do("UPDATE player SET last_login=? WHERE name='$player->{$i}{name}'", scalar(gmtime));
+	$r += DBI::Do("UPDATE player SET last_dns=? WHERE name='$player->{$i}{name}'", $socket->{$i}{dns});
+	$r += DBI::Do("UPDATE player SET total_login=$player->{$i}{total_login} WHERE name='$player->{$i}{name}'");
+	$r += DBI::Do("UPDATE player SET state=0 WHERE name='$player->{$i}{name}'");
+	$r += DBI::Do("UPDATE player SET flags=$player->{$i}{flags} WHERE name='$player->{$i}{name}'");
+	$r += DBI::Do("UPDATE player SET privs=$player->{$i}{privs} WHERE name='$player->{$i}{name}'");
+	$r += DBI::Do("UPDATE player SET gender=$player->{$i}{gender} WHERE name='$player->{$i}{name}'");
+	$r += DBI::Do("UPDATE player SET mod=NOW() WHERE name='$player->{$i}{name}'");
+
+	my $id = Player::Get::Id($player->{$i}{name});
+
+	$r += DBI::Do("UPDATE superplayer SET channel_room=$player->{$i}{channel_room} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET channel_shout=$player->{$i}{channel_shout} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET channel_tell=$player->{$i}{channel_tell} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET channel_friend=$player->{$i}{channel_friend} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET channel_echo=$player->{$i}{channel_echo} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET channel_session=$player->{$i}{channel_session} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET channel_su=$player->{$i}{channel_su} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET channel_admin=$player->{$i}{channel_admin} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET channel_custom=$player->{$i}{channel_custom} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET ww=$player->{$i}{ww} WHERE id=$id");
+	$r += DBI::Do("UPDATE superplayer SET prefix=? WHERE id=$id", $player->{$i}{prefix});
+	$r += DBI::Do("UPDATE superplayer SET PS1=? WHERE id=$id", $player->{$i}{PS1});
+	$r += DBI::Do("UPDATE superplayer SET PS2=? WHERE id=$id", $player->{$i}{PS2});
+	$r += DBI::Do("UPDATE superplayer SET title=? WHERE id=$id", $player->{$i}{title});
+	$r += DBI::Do("UPDATE superplayer SET groundstring=? WHERE id=$id", $player->{$i}{groundstring});
+	$r += DBI::Do("UPDATE superplayer SET entermsg=? WHERE id=$id", $player->{$i}{entermsg});
+	$r += DBI::Do("UPDATE superplayer SET connectmsg=? WHERE id=$id", $player->{$i}{connectmsg});
+	$r += DBI::Do("UPDATE superplayer SET disconnectmsg=? WHERE id=$id", $player->{$i}{disconnectmsg});
+	$r += DBI::Do("UPDATE superplayer SET reconnectmsg=? WHERE id=$id", $player->{$i}{reconnectmsg});
+	$r += DBI::Do("UPDATE superplayer SET description=? WHERE id=$id", $player->{$i}{description});
+	$r += DBI::Do("UPDATE superplayer SET plan=? WHERE id=$id", $player->{$i}{plan});
+
+	$r += Player::Save::List($i);
+	return ($r);
+}
+
+sub DBI::Do
+{
+	my $do = shift;
+	my @values = @_;
+
+	return ($dbh->do($do, {}, @values));
+}
+
+sub Editor::Start
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1)
+	}
+
+	$player->{$i}{state} |= EDITOR;
+	$player->{$i}{state} &= ~PROMPT;
+	$player->{$i}{func} = \&Editor::Input;
+
+	if(exists($player->{$i}{edit_exist}))
+	{
+		my @tmp = split("\n", $player->{$i}{edit_exist});
+		$player->{$i}{editor} = \@tmp;
+	}
+	else
+	{
+		$player->{$i}{editor} = [ ];
+	}
+
+	Player::Tell($i, "\nAnteek Editor v1.2\n");
+	Player::Tell($i, "------------------\n");
+	Player::Tell($i, "Any text entered within the editor will go into the buffer.  To exit the\n");
+	Player::Tell($i, "editor or make changes, enter a single ^N^H@^N and hit <RETURN>.\n\n");
+	Player::Tell($i, "Please don't hit return when entering room descriptions, less the talker\n");
+	Player::Tell($i, "will not wrap the lines correctly for everyone.\n");
+	Player::Tell($i, "^N^H|0^N----^H5^N----^H10^N---^H15^N---^H20^N---^H25^N---^H30^N---^H35^N---^H40^N---^H45^N---^H50^N---^H55^N---^H60^N---^H65^N---^H70^N----^H|^N\n");
+
+	if(exists($player->{$i}{edit_exist}))
+	{
+		Player::Tell($i, $player->{$i}{edit_exist});
+	}
+	Player::Prompt($i, $player->{$i}{PS2});
+	return (0);
+}
+
+sub Editor::Input
+{
+	my $i = shift;
+	my $str = shift;
+
+	Player::Get::Function($i);
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1)
+	}
+
+	if($str eq '@')
+	{
+		$player->{$i}{func} = \&Editor::Modify;
+		Player::Tell($i, "\nLeaving editor.  Use ^N^H@@^N to save and exit.  Use ^N^H@^N to quit.  See ^N^Hhelp^N for a list of editor commands.\n");
+		Player::Prompt($i, 'editor>');
+		return (0);
+	}
+
+	push(@{$player->{$i}{editor}}, $str);
+	Player::Prompt($i, $player->{$i}{PS2});
+	return (0);
+}
+
+sub Editor::Modify
+{
+	my $i = shift;
+	my $str = shift;
+
+	if($str eq '@@')
+	{
+		delete $player->{$i}{func};
+		$player->{$i}{state} &= ~EDITOR;
+		$player->{$i}{state} |= PROMPT;
+		my $what = $player->{$i}{edit_what};
+		$$what = join("\n", @{$player->{$i}{editor}});
+		delete $player->{$i}{editor};
+		delete $player->{$i}{edit_what};
+		Player::Tell($i, "Saved changes.\n");
+		return (0);
+	}
+
+	if($str eq '@')
+	{
+		delete $player->{$i}{func};
+		$player->{$i}{state} &= ~EDITOR;
+		$player->{$i}{state} |= PROMPT;
+		delete $player->{$i}{tmp};
+		delete $player->{$i}{editor};
+		delete $player->{$i}{edit_what};
+		Player::Tell($i, "Changed NOT saved.\n");
+		return (0);
+	}
+
+	if($str eq 'view')
+	{
+		my $c = 0;
+		foreach my $line (@{$player->{$i}{editor}})
+		{
+			my $str = sprintf("%-2s %s\n", $c, $line);
+			$c++;
+			Player::Tell($i, $str);
+		}
+		Player::Prompt($i, 'editor>');
+		return (0);
+	}
+
+	if($str eq 'edit')
+	{
+		$player->{$i}{func} = \&Editor::Input;
+
+		Player::Tell($i, "^N^H|0^N----^H5^N----^H10^N---^H15^N---^H20^N---^H25^N---^H30^N---^H35^N---^H40^N---^H45^N---^H50^N---^H55^N---^H60^N---^H65^N---^H70^N----^H|^N\n");
+		Player::Tell($i, join("\n", @{$player->{$i}{editor}}));
+		Player::Prompt($i, $player->{$i}{PS2});
+		return (0);
+	}
+
+	if($str eq 'wipe')
+	{
+		$player->{$i}{editor} = [ ];
+		Player::Tell($i, "Buffer completely wiped.\n");
+		Player::Prompt($i, 'editor>');
+		return (0);
+	}
+
+	if($str eq 'help')
+	{
+		Player::Tell($i, $config->{file}{editor_help});
+		Player::Prompt($i, 'editor>');
+		return (0);
+	}
+
+	else
+	{
+		Player::Tell($i, "Sub-command not found.\n");
+		Player::Prompt($i, 'editor>');
+		return (-1);
+	}
+}
+
+sub Login::Get::Login
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1)
+	}
+
+	$_ = shift;
+
+	s/^\s*//;
+	s/\s*$//;
+	chomp;
+
+	if(/^quit/i)
+	{
+		$socket->{$i}{state} |= DISCONNECT;
+		return (-1);
+	}
+
+	if(/\.\./ || /\//)
+	{
+		my $str = "Logging hacking attempt from $socket->{$i}{ip}:$socket->{$i}{port}.  Good-bye.\n";
+
+		Makelog('hacking', "Hacking attempt from $socket->{$i}{ip}:$socket->{$i}{port}.  Entered `$_'");
+		syswrite($socket->{$i}{sock}, $str, length($str));
+		$socket->{$i}{state} |= DISCONNECT;
+		return (-1);
+	}
+
+	if(/^new/i)
+	{
+		Player::Tell($i, $config->{file}{welcome});
+		Player::Prompt($i, '[Hit <RETURN> to continue]');
+		$player->{$i}{func} = \&Login::Get::Prename;
+		return (0);
+	}
+	elsif(/^(\w+)/)
+	{
+		my $name = $1;
+
+		if(Player::Check::Exists($name) == 0)
+		{
+			foreach my $p (keys %{$player})
+			{
+				Player::Check::Structure($p) == -1 and next;
+				if($p != $i && $player->{$p}{name} eq $name)
+				{
+					Player::Tell($p, "You feel as if your very lifestrings are being plucked.\n");
+					next;
+				}
+			}
+
+			$player->{$i}{tmp} = $name;
+			Player::Prompt($i, 'Password:');
+			Player::Tell($i, "\377\373\001");
+			$player->{$i}{func} = \&Login::Get::Password;
+			return (0);
+		}
+		else
+		{
+			Player::Tell($i, "\nNo such character in database.\n");
+			Player::Tell($i, "Use the name 'new' to create a new character\n");
+			Player::Prompt($i, 'prancing pony login:');
+			return (-1);
+		}
+	}
+	else
+	{
+		Player::Tell($i, "Use the name 'new' to create a new character\n");
+		Player::Prompt($i, 'prancing pony login:');
+		return (-1);
+	}
+}
+
+sub Login::Get::Password
+{
+	my $i = shift;
+	my $str = shift;
+
+	$player->{$i}{name} = $player->{$i}{tmp};
+	if(Password::Confirm($i, $str))
+	{
+		Player::Load($i);
+		$player->{$i}{password} = $str;
+		Player::Tell($i, "\377\374\001");
+
+		my $recon = 0;
+		my $zombie = 0;
+
+		my @admin = split(/,/, $config->{'talker.admin'});
+		foreach my $name (@admin)
+		{
+			$name =~ s/^\s*//;
+			$name =~ s/\s*$//;
+			chomp($name);
+
+			if($player->{$i}{name} eq $name)
+			{
+				$player->{$i}{privs} |= RESIDENT;
+				$player->{$i}{privs} |= MAIL;
+				$player->{$i}{privs} |= NEWS;
+				$player->{$i}{privs} |= SESSION;
+				$player->{$i}{privs} |= BUILDER;
+				$player->{$i}{privs} |= PSU;
+				$player->{$i}{privs} |= SU;
+				$player->{$i}{privs} |= ASU;
+				$player->{$i}{privs} |= LOWER_ADMIN;
+				$player->{$i}{privs} |= ADMIN;
+				$player->{$i}{privs} |= CODER;
+				$player->{$i}{privs} |= HCADMIN;
+			}
+		}
+
+		foreach my $p (keys %{$player})
+		{
+			if($p != $i && $player->{$p}{name} eq $player->{$i}{name})
+			{
+				$recon = 1;
+				my $str = "Your mind slowly drifts away as your body is taken over by another instance from $socket->{$i}{ip}\n";
+				if(exists($socket->{$p}))
+				{
+					syswrite($socket->{$p}{sock}, $str, length($str));
+					$socket->{$p}{state} |= DISCONNECT;
+				}
+				else
+				{
+					while((my $k, my $y) = each(%{$player->{$p}}))
+					{
+						$zombie = 1;
+						$player->{$i}{$k} = $y;
+					}
+					delete $player->{$p};
+				}
+			}
+		}
+
+		if($recon == 1)
+		{
+			if($zombie == 1)
+			{
+				Player::Tell($i, "\n\n^N^HYou reanimate your corpse .. ^N\n");
+				$player->{$i}{state} &= ~ZOMBIE;
+				Room::Tell($player->{$i}{room}, $i, "% $player->{$i}{name} reanimates its body.\n");
+				Player::Inform($i, INF_REANIMATE);
+			}
+			else
+			{
+				Player::Tell($i, "\n\n^N^HYou were already on the program, i'll stitch you back in perfectly!^N\n");
+			}
+
+			Room::Tell($player->{$i}{room}, $i, "% $player->{$i}{name} $player->{$i}{reconnectmsg}\n");
+			Player::Inform($i, INF_RECONNECT);
+			$player->{$i}{state} |= PROMPT;
+			$player->{$i}{state} |= LOGGED_IN;
+			delete $player->{$i}{func};
+
+			Player::Tell($i, "Reconnection complete.\n");
+			return (0);
+		}
+
+		$player->{$i}{channel_hilite}	= BOLD;
+		$player->{$i}{func} = \&Player::Display::MOTD;
+		Player::Tell($i, $config->{file}{motd});
+		Player::Prompt($i, '[Hit <RETURN> to continue]');
+		return (0);
+	}
+	else
+	{
+		my $str = "Login incorrect\n\r\n\r\n\r";
+
+		delete $player->{$i}{name};
+		if(exists($socket->{$i}))
+		{
+			syswrite($socket->{$i}{sock}, $str, length($str));
+		}
+		$socket->{$i}{state} |= DISCONNECT;
+		return (-1);
+	}
+}
+
+sub Login::Get::Prename
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+
+	Player::Tell($i, "\nPlease enter a name you wish to be known as.  We ask that you use alphabetic characters only.\n");
+	Player::Prompt($i, 'Whom shall you be known as?');
+
+	$player->{$i}{func} = \&Login::Get::Name;
+	return (0);
+}
+
+sub Login::Get::Name
+{
+	my $i = shift;
+	my $str = shift;
+
+	Player::Get::Function($i);
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	if(Player::Check::Name($i, $str) == -1)
+	{
+		Player::Prompt($i, 'Whom shall you be known as?');
+		return (-1);
+	}
+
+	if(Player::Check::Exists($str) == 0)
+	{
+		Player::Tell($i, "That name is already in use, please try again.\n");
+		Player::Prompt($i, 'Whom shall you be known as?');
+		return (-1);
+	}
+
+	Player::Prompt($i, "$str, is that correct? [Y/n]:");
+	$player->{$i}{tmp} = $str;
+	$player->{$i}{func} = \&Login::Get::Confirmation;
+
+	return (0);
+}
+
+sub Login::Get::Confirmation
+{
+	my $i = shift;
+
+	$_ = shift;
+
+	Player::Get::Function($i);
+	if(/^n/i)
+	{
+		delete $player->{$i}{tmp};
+		$player->{$i}{func} = \&Login::Get::Login;
+
+		Player::Tell($i, "Use the name 'new' to create a new character\n");
+		Player::Prompt($i, 'prancing pony login:');
+		return (-1);
+	}
+	else
+	{
+		Player::Setup::Newbie($i);
+
+		$player->{$i}{func} = \&Player::Display::MOTD;
+		Player::Tell($i, $config->{file}{motd});
+		Player::Prompt($i, '[Hit <RETURN> to continue]');
+		return (0);
+	}
+}
+
+sub Password::Confirm
+{
+	my $i = shift;
+	my $str = shift;
+
+	$str =~ s/'/\\'/g;
+	my $sth = $dbh->prepare("SELECT name from player where name='$player->{$i}{name}' AND password=password('$str')");
+	my $ret = $sth->execute;
+	$sth->finish;
+	$ret eq '0E0' ? return (0) : return (-1);
+}
+
+sub Player::Inform
+{
+	my $i = shift;
+	my $type = shift;
+	my $str;
+
+	$str = "[$player->{$i}{name} decays into a mass ooz]" if($type == INF_ZOMBIE);
+	$str = "[$player->{$i}{name} disconnects]" if($type == INF_DISCONNECT);
+	$str = "[$player->{$i}{name} has conneced]" if($type == INF_CONNECT);
+	$str = "[$player->{$i}{name} reanimates its body]" if($type == INF_REANIMATE);
+	$str = "[$player->{$i}{name} reconnects]" if($type == INF_RECONNECT);
+
+	length($str) or return (-1);
+
+	foreach my $p (keys %{$player})
+	{
+		$p == $i and next;
+		if($player->{$p}{flags} & INFORM_ALL)
+		{
+			if($player->{$p}{privs} & SU)
+			{
+				$channel = CHAN_CUSTOM;
+				Player::Tell($p, "$str [$socket->{$i}{ip}]\n");
+				$channel = CHAN_NORMAL;
+			}
+			else
+			{
+				$channel = CHAN_CUSTOM;
+				Player::Tell($p, "$str\n");
+				$channel = CHAN_NORMAL;
+			}
+			next;
+		}
+
+		foreach my $m (@{$player->{$p}{list_inform}})
+		{
+			if($m == $player->{$i}{id})
+			{
+				if($player->{$p}{privs} & SU)
+				{
+					$channel = CHAN_CUSTOM;
+					Player::Tell($p, "$str [$socket->{$i}{ip}]\n");
+					$channel = CHAN_NORMAL;
+				}
+				else
+				{
+					$channel = CHAN_CUSTOM;
+					Player::Tell($p, "$str\n");
+					$channel = CHAN_NORMAL;
+				}
+			}
+		}
+
+		foreach my $m (@{$player->{$p}{list_beep}})
+		{
+			if($m == $player->{$i}{id})
+			{
+				Player::Tell($p, "\007");
+			}
+		}
+	}
+
+	return (0);
+}
+
+sub Password::Get::New
+{
+	my $i = shift;
+
+	$player->{$i}{tmp} = shift;
+
+	Player::Get::Function($i);
+	Player::Prompt($i, "\nRe-enter new password:");
+	$player->{$i}{func} = \&Password::Confirm::New;
+
+	return (0);
+}
+
+sub Password::Confirm::New
+{
+	my $i = shift;
+	my $str = shift;
+
+	Player::Get::Function($i);
+	if($str eq $player->{$i}{tmp})
+	{
+		Player::Tell($i, "\nPassword updated.\n");
+		Player::Tell($i, "\377\374\001");
+		$player->{$i}{state} |= PROMPT;
+		$player->{$i}{password} = $str;
+		Command::Save($i);
+		delete $player->{$i}{func};
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, "\nPasswords don't match.\n");
+		Player::Prompt($i, "New password:");
+		$player->{$i}{func} = \&Password::Get::New;
+		return (-1);
+	}
+}
+
+sub Password::Get::Current
+{
+	my $i = shift;
+	my $str = shift;
+
+	Player::Get::Function($i);
+	if(Password::Confirm($i, $str))
+	{
+		Player::Prompt($i, "\nNew password:");
+		$player->{$i}{func} = \&Password::Get::New;
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, "Incorrect password.\n");
+		Player::Tell($i, "\377\374\001");
+		$player->{$i}{state} |= PROMPT;
+		delete $player->{$i}{func};
+		return (-1);
+	}
+}
+
+sub Room::Move
+{
+	my $p = shift;
+	my $r = shift;
+
+	$player->{$p}{room} = $r;
+	Command::Room::Look($p);
+	return (0);
+}
+
+sub Room::Tell
+{
+	my $r = shift;
+	my $p = shift;
+	my $str = shift;
+	my $chan = shift;
+
+	$chan or $chan = CHAN_ROOM;
+
+	exists($room->{$r}) or return (-1);
+	exists($player->{$p}) or return (-1);
+
+	foreach my $dude (keys %{$player})
+	{
+		Player::Check::Structure($dude) == -1 and next;
+		foreach my $key (@{$player->{$dude}{list_ignore}})
+		{
+			if($key == $player->{$p}{id})
+			{
+				goto R_NEXT;
+			}
+		}
+
+		if($player->{$dude}{room} == $r && $p != $dude && $player->{$dude}{state} & LOGGED_IN)
+		{
+			$channel = $chan;
+			Player::Tell($dude, $str);
+			$channel = CHAN_NORMAL;
+		}
+		R_NEXT:
+	}
+
+	return (0);
+}
+
+sub Room::Check::Exists
+{
+	my $room = shift;
+
+	my $sth = $dbh->prepare("SELECT id FROM room WHERE id=$room");
+	my $ret = $sth->execute;
+
+	$sth->finish;
+
+	$ret eq '0E0' ? return (-1) : return (0);
+}
+
+sub Room::Load
+{
+	my $r = shift;
+
+	if(Room::Check::Exists($r) == -1)
+	{
+		return (-1);
+	}
+
+	if(exists($room->{$r}))
+	{
+		Makelog('room', "WARNING: room $r has internal reference, deleteing and loading sql reference.");
+		delete $room->{$r};
+	}
+
+	my $sth = $dbh->prepare("SELECT * from room WHERE id=$r");
+
+	$sth->execute;
+
+	while(my $ref = $sth->fetchrow_hashref)
+	{
+		foreach my $key (keys %{$ref})
+		{
+			$room->{$r}{$key} = $$ref{$key};
+		}
+	}
+
+	$sth->finish;
+
+	open(RD, "<lib/rooms/$r") or Makelog('room', "couldn't open room description for room $r");
+	while(<RD>)
+	{
+		$room->{$r}{description} .= $_;
+	}
+	close(RD);
+
+	return (0);
+}
+
+sub Room::Save
+{
+	my $r = shift;
+
+	exists($room->{$r}) or return (-1);
+
+	delete $room->{$r}{dirty};
+	if(Room::Check::Exists($r) == -1)
+	{
+		return (Room::Insert($r));
+	}
+	else
+	{
+		return (Room::Update($r));
+	}
+}
+
+sub Room::Update
+{
+	my $r = shift;
+	my $e;
+
+	exists($room->{$r}) or return (-1);
+
+	$e += DBI::Do("UPDATE room SET zone=$room->{$r}{zone} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET owner=$room->{$r}{owner} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET creator=$room->{$r}{creator} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET flags=$room->{$r}{flags} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET exit_north=$room->{$r}{exit_north} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET exit_south=$room->{$r}{exit_south} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET exit_east=$room->{$r}{exit_east} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET exit_west=$room->{$r}{exit_west} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET exit_up=$room->{$r}{exit_up} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET exit_down=$room->{$r}{exit_down} WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET mod=NOW() WHERE id=$r");
+	$e += DBI::Do("UPDATE room SET name=? WHERE id=$r", $room->{$r}{name});
+	$e += DBI::Do("UPDATE room SET short=? WHERE id=$r", $room->{$r}{short});
+
+	$room->{$r}{description} =~ s/\n//g;
+	$room->{$r}{description} =~ s/\r//g;
+	open(RD, ">lib/rooms/$r") or warn "Can't open lib/rooms/$r\n";
+	{
+		print RD "$room->{$r}{description}";
+	}
+	close (RD);
+
+	return ($e);
+}
+
+sub Room::Insert
+{
+	my $r = shift;
+	my $e;
+
+	exists($room->{$r}) or return (-1);
+
+	my $zone = Room::Get::Zone($r);
+	$e += DBI::Do("INSERT into room (id, zone) VALUES($r, $zone)");
+	$e += Room::Update($r);
+
+	return ($e);
+}
+
+sub Room::Create
+{
+	my $i = shift;
+	my $r = shift;
+
+	if(Zone::Check::Exists(Room::Get::Zone($r)) == 0)
+	{
+		unless(exists($zone->{Room::Get::Zone($r)}))
+		{
+			Player::Tell($i, "That zone isn't loaded.\n");
+			return (-1);
+		}
+	}
+
+	if(!(exists($zone->{Room::Get::Zone($r)})))
+	{
+		Player::Tell($i, "That zone doesn't exist.\n");
+		return (-1);
+	}
+
+	if(Zone::Confirm::Owner($i, Room::Get::Zone($r)) == -1)
+	{
+		Player::Tell($i, "That room would land in a zone that doesn't belong to you.\n");
+		return (-1);
+	}
+
+	if(exists($room->{$r}))
+	{
+		Player::Tell($i, "That room already exists.\n");
+		return (-1);
+	}
+
+	if(Room::Check::Exists($r) == 0)
+	{
+			Player::Tell($i, "That room exists in the SQL archive, but isn't loaded.\n");
+			return (-1);
+	}
+
+	$room->{$r}{exit_north} = -1;
+	$room->{$r}{exit_south} = -1;
+	$room->{$r}{exit_east} = -1;
+	$room->{$r}{exit_west} = -1;
+	$room->{$r}{exit_up} = -1;
+	$room->{$r}{exit_down} = -1;
+
+	$room->{$r}{id} = $r;
+	$room->{$r}{zone} = Room::Get::Zone($r);
+	$room->{$r}{owner} = $player->{$i}{id};
+	$room->{$r}{creator} = $player->{$i}{id};
+	$room->{$r}{flags} = 0;
+	$room->{$r}{name} = 'null';
+	$room->{$r}{short} = 'null';
+	$room->{$r}{description} = 'null';
+
+	Player::Tell($i, "Created room $r\n");
+	return (0);
+}
+
+sub Room::Display::Move
+{
+	my $p = shift;
+	my $r = shift;
+	my $d = shift;
+
+	exists($player->{$p}) or return (-1);
+	exists($room->{$r}) or return (-1);
+
+	my %dir	= (	1	=> 'north',
+			2	=> 'south',
+			3	=> 'east',
+			4	=> 'west',
+			5	=> 'up',
+			6	=> 'down',
+		);
+
+	exists($dir{$d}) or return (-1);
+
+	Room::Tell($player->{$p}{room}, $p, "- $player->{$p}{name} leaves $dir{$d}\n");
+	($d % 2 == 0) ? $d-- : $d++;
+	# Room::Tell($r, $p, " $player->{$p}{name} has arrived from the $dir{$d}\n");
+	Room::Tell($r, $p, "- $player->{$p}{name} has arrived.\n");
+	return (0);
+}
+
+sub Room::ShowExits
+{
+	my $r = shift;
+	my $str;
+
+	exists($room->{$r}) or return (-1);
+
+	$str .= '[Exits: ';
+
+	if($room->{$r}{exit_north} != -1 && exists($room->{$room->{$r}{exit_north}}))
+	{
+		$str .= 'north ';
+	}
+	if($room->{$r}{exit_south} != -1 && exists($room->{$room->{$r}{exit_south}}))
+	{
+		$str .= 'south ';
+	}
+	if($room->{$r}{exit_east} != -1 && exists($room->{$room->{$r}{exit_east}}))
+	{
+		$str .= 'east ';
+	}
+	if($room->{$r}{exit_west} != -1 && exists($room->{$room->{$r}{exit_west}}))
+	{
+		$str .= 'west ';
+	}
+	if($room->{$r}{exit_up} != -1 && exists($room->{$room->{$r}{exit_up}}))
+	{
+		$str .= 'up ';
+	}
+	if($room->{$r}{exit_down} != -1 && exists($room->{$room->{$r}{exit_down}}))
+	{
+		$str .= 'down ';
+	}
+
+	$str .= "]\n";
+	return ($str);
+}
+
+sub Room::Get::Zone
+{
+	my $rid = shift;
+
+	# Take the modulo of 100, subtract that from itself, then divide
+	# itself from 100.  That should do it.
+	return (int(($rid-($rid%100))/100));
+}
+
+sub Room::Move::Check
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	unless(exists($player->{$i}{room}))
+	{
+		Player::Tell($i, "But you aren't in a room!\n");
+		return (-1);
+	}
+
+	unless(exists($room->{$player->{$i}{room}}))
+	{
+		Player::Tell($i, "But the room you're standing in doesn't exist!\n");
+		return (-1);
+	}
+
+	return (0);
+}
+
+sub Room::Link
+{
+	my $p = shift;
+	my $d = shift;
+	my $r = shift;
+
+	exists($player->{$p}) or return (-1);
+
+	if(exists($room->{$r}) || $r == -1)
+	{
+		my $pr = $player->{$p}{room};
+
+		$room->{$pr}{dirty} = 1;
+
+		$d == NORTH and $room->{$pr}{exit_north} = $r;
+		$d == EAST and $room->{$pr}{exit_east} = $r;
+		$d == SOUTH and $room->{$pr}{exit_south} = $r;
+		$d == WEST and $room->{$pr}{exit_west} = $r;
+		$d == UP and $room->{$pr}{exit_up} = $r;
+		$d == DOWN and $room->{$pr}{exit_down} = $r;
+		Player::Tell($p, "Link set.\n");
+		return (0);
+	}
+	elsif(Room::Check::Exists($r) == 0)
+	{
+		Player::Tell($p, "Load the zone first.\n");
+		return (-1);
+	}
+
+	Player::Tell($p, "Couldn't find that room.\n");
+	return (-1);
+}
+
+sub Zone::Confirm::Owner
+{
+	my $p = shift;
+	my $z = shift;
+
+	exists($player->{$p}{id}) or return (-1);
+	if($player->{$p}{privs} & ADMIN)
+	{
+		return (0);
+	}
+
+	my $sth = $dbh->prepare("SELECT owner FROM zone WHERE zone=$z");
+
+	$sth->execute;
+
+	while(my $ref = $sth->fetchrow_arrayref)
+	{
+		if($player->{$p}{id} == $ref->[0])
+		{
+			$sth->finish;
+			return (0);
+		}
+	}
+
+	$sth->finish;
+	return (-1);
+}
+
+sub Custom::Wall
+{
+	my $i = shift;
+	my $str = shift;
+
+	foreach my $p (keys %{$player})
+	{
+		if($player->{$i}{cc} eq $player->{$p}{cc})
+		{
+			$channel = CHAN_CUSTOM;
+			Player::Tell($p, $str);
+			$channel = CHAN_NORMAL;
+		}
+	}
+
+	return (0);
+}
+
+sub Admin::Wall
+{
+	my $str = join('', @_);
+
+	foreach my $p (keys %{$player})
+	{
+		if($player->{$p}{privs} & ADMIN)
+		{
+			$channel = CHAN_ADMIN;
+			Player::Tell($p, $str);
+			$channel = CHAN_NORMAL;
+		}
+	}
+
+	return (0);
+}
+
+sub SU::Wall
+{
+	my $str = join('', @_);
+
+	foreach my $p (keys %{$player})
+	{
+		if($player->{$p}{privs} & PSU)
+		{
+			$channel = CHAN_SU;
+			Player::Tell($p, $str);
+			$channel = CHAN_NORMAL;
+		}
+	}
+
+	return (0);
+}
+
+sub Zone::Check::Exists
+{
+	my $rack = shift;
+
+	my $sth = $dbh->prepare("SELECT mod FROM zone WHERE zone=$rack");
+	my $ret = $sth->execute;
+
+	$sth->finish;
+
+	$ret eq '0E0' ? return (-1) : return (0);
+}
+
+sub Zone::Save
+{
+	my $rack = shift;
+
+	if(exists($zone->{$rack}))
+	{
+		if(Zone::Check::Exists($rack) == -1)
+		{
+			return (Zone::Insert($rack));
+		}
+		else
+		{
+			return (Zone::Update($rack));
+		}
+	}
+	else
+	{
+		return (-1);
+	}
+}
+
+sub Zone::Insert
+{
+	my $rack = shift;
+	my $r;
+
+	$r += DBI::Do("INSERT into zone (id, zone, created) VALUES(NULL, $rack, NOW())");
+	$r += Zone::Update($rack);
+
+	return ($r);
+}
+
+sub Zone::Update
+{
+	my $rack = shift;
+	my $r;
+
+	$r += DBI::Do("UPDATE zone SET owner=$zone->{$rack}{owner} WHERE zone=$rack");
+	$r += DBI::Do("UPDATE zone SET creator=$zone->{$rack}{creator} WHERE zone=$rack");
+	$r += DBI::Do("UPDATE zone SET age=$zone->{$rack}{age} WHERE zone=$rack");
+	$r += DBI::Do("UPDATE zone SET flags=$zone->{$rack}{flags} WHERE zone=$rack");
+	$r += DBI::Do("UPDATE zone SET mod=NOW() WHERE zone=$rack");
+	$r += DBI::Do("UPDATE zone SET name=? WHERE zone=$rack", $zone->{$rack}{name});
+	$r += DBI::Do("UPDATE zone SET description=? WHERE zone=$rack", $zone->{$rack}{description});
+
+	return ($r);
+}
+
+sub Zone::Load
+{
+	my $rack = shift;
+
+	if(Zone::Check::Exists($rack) == -1)
+	{
+		return (-1);
+	}
+
+	if(exists($zone->{$rack}))
+	{
+		Makelog('zone', "WARNING: rack $rack has internal reference, deleteing and loading sql reference.");
+		delete $zone->{$rack};
+	}
+
+	my $sth = $dbh->prepare("SELECT * from zone WHERE zone=$rack");
+
+	$sth->execute;
+
+	while(my $ref = $sth->fetchrow_hashref)
+	{
+		foreach my $key (keys %{$ref})
+		{
+			$zone->{$rack}{$key} = $$ref{$key};
+		}
+	}
+
+	$sth->finish;
+	my $fields = keys (%{$zone->{$rack}});
+
+	Makelog('zone', "loaded zone $rack with $fields fields");
+
+	return (0);
+}
+
+sub Zone::Create
+{
+	my $creator = shift;
+	my $owner = shift;
+	my $rack = shift;
+
+	$zone->{$rack}{zone} = $rack;
+	$zone->{$rack}{creator} = $creator;
+	$zone->{$rack}{owner} = $owner;
+	$zone->{$rack}{flags} = 0;
+	$zone->{$rack}{age} = 60;
+	$zone->{$rack}{name} = 'null';
+	$zone->{$rack}{description} = 'null';
+
+	return (0);
+}
+
+sub Command::Admin::Ps
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+
+	Player::Banner($i, 0, '-', "$config->{'talker.name'} Process Snapshot");
+	Player::Tell($i, "WHO                  PID    WHAT (use ^Hrelease^N to disconnect processes)\n");
+
+	foreach my $p (keys %{$player})
+	{
+		my $name = '<NOT LOGGED IN>';
+		my $str;
+
+		exists($player->{$p}{name}) and $name = $player->{$p}{name};
+		$str = sprintf("%-20s %-6s %s\n", $name, $p, $player->{$p}{WHAT});
+
+		Player::Tell($i, $str);
+	}
+
+	Player::Banner($i, 0, '-', undef);
+	my $mfaults = abs($config->{'mfaults'});
+	Player::Tell($i, "Minor faults: $mfaults\n");
+	return (0);
+}
+
+sub Command::Save
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	if(Player::Check::Exists($player->{$i}{name}) == 0)
+	{
+		my $r = (Player::Update($i));
+
+		Player::Tell($i, "(UPDATE) Query OK $r fields updated.\n");
+	}
+	else
+	{
+		my $r = (Player::Save($i));
+
+		Player::Tell($i, "(INSERT) Query OK modified $r fields.\n");
+	}
+	$player->{$i}{id} = Player::Get::Id($player->{$i}{name});
+	return (0);
+}
+
+sub Command::Quit
+{
+	my $i = shift;
+
+	$_ = shift;
+
+	Player::Get::Function($i);
+	if(/zombie/i)
+	{
+		$player->{$i}{state} |= ZOMBIE;
+		$socket->{$i}{state} |= DISCONNECT;
+	}
+	else
+	{
+		$socket->{$i}{state} |= DISCONNECT;
+	}
+
+	return (0);
+}
+
+sub Command::Password
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	$player->{$i}{state} &= ~PROMPT;
+
+	if(length($player->{$i}{password}))
+	{
+		Player::Tell($i, "\377\373\001");
+		Player::Prompt($i, "Current password: ");
+		$player->{$i}{func} = \&Password::Get::Current;
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, "\377\373\001");
+		Player::Prompt($i, "New password: ");
+		$player->{$i}{func} = \&Password::Get::New;
+		return (0);
+	}
+}
+
+sub Command::Zone::Create
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	unless($player->{$i}{id})
+	{
+		Player::Tell($i, "You don't exist, go away.\n");
+		return (-1);
+	}
+
+	$_ = shift;
+
+	if(/^(\w+)\s+(\d+)$/)
+	{
+		my $owner = $1;
+		my $rack = $2;
+
+		if(exists($zone->{$rack}) || Zone::Check::Exists($rack) == 0)
+		{
+			Player::Tell($i, "That zone already exists.\n");
+			return (-1);
+		}
+
+		if(Player::Check::Exists($owner) == -1)
+		{
+			Player::Tell($i, "Couldn't find that player in the database to assign to that zone.\n");
+			return (-1);
+		}
+
+		my $oid = Player::Get::Id($owner);
+		my $cid = Player::Get::Id($player->{$i}{name});
+		Zone::Create($cid, $oid, $rack);
+		Makelog('zone', "$player->{$i}{name} creates zone $rack for $owner");
+		Player::Tell($i, "You create zone $rack for the use $owner.\n");
+		return (0);
+	}
+	elsif(/^example/i)
+	{
+		Player::Tell($i, " Usage : zone_create [example|owner] [rack id]\n");
+		Player::Tell($i, "         zone_create rohan 0\n");
+		Player::Tell($i, "         zone_create dolffie 1\n");
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, " Usage : zone_create <[example]|owner> <rack id>\n");
+		return (-1);
+	}
+}
+
+sub Command::Zone::Stat
+{
+	my $i = shift;
+	my $rack;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	$_ = shift;
+
+	exists($player->{$i}{zone_edit}) and $rack = $player->{$i}{zone_edit};
+
+	if(/^(\d+)$/ || length($rack))
+	{
+		length($1) and $rack = $1;
+
+		if(exists($zone->{$rack}))
+		{
+			Player::Banner($i, 0, '-', "Statistics for zone $rack");
+			Player::Tell($i, "zone: $zone->{$rack}{zone}\n");
+			my $owner = Player::Get::NameById($zone->{$rack}{owner});
+			my $creator = Player::Get::NameById($zone->{$rack}{creator});
+			Player::Tell($i, "owner: $owner\n");
+			Player::Tell($i, "creator: $creator\n");
+			Player::Tell($i, "age: $zone->{$rack}{age}\n");
+			Player::Tell($i, "created: $zone->{$rack}{created}\n");
+			Player::Tell($i, "last modified: $zone->{$rack}{mod}\n");
+			Player::Tell($i, "name: $zone->{$rack}{name}\n");
+			Player::Tell($i, "description: $zone->{$rack}{description}\n");
+			Player::Banner($i, 0, '-', undef);
+		}
+		elsif(Zone::Check::Exists($rack) == 0)
+		{
+			Player::Tell($i, "That zone exists, but isn't loaded.\n");
+			return (-1);
+		}
+		else
+		{
+			Player::Tell($i, "That zone doesn't exist.\n");
+			return (-1);
+		}
+	}
+	else
+	{
+		Player::Tell($i, " Usage : zstat [rack]\n");
+		return (-1);
+	}
+}
+
+sub Command::Zone::Save
+{
+	my $i = shift;
+	my $rack;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	$_ = shift;
+
+	exists($player->{$i}{zone_edit}) and $rack = $player->{$i}{zone_edit};
+
+	if(/^(\d+)$/ || length($rack))
+	{
+		length($1) and $rack = $1;
+
+		if(exists($zone->{$rack}))
+		{
+			my $pid = Player::Get::Id($player->{$i}{name});
+
+			if($zone->{$rack}{owner} == $pid || $player->{$i}{privs} & ADMIN)
+			{
+				my $r = Zone::Save($rack);
+
+				delete $zone->{$rack}{dirty};
+				Player::Tell($i, "Zone $rack saved with $r modifications.\n");
+				return (0);
+			}
+			else
+			{
+				Player::Tell($i, "You aren't the owner of that rack.\n");
+				return (-1);
+			}
+		}
+		elsif(Zone::Check::Exists($rack) == 0)
+		{
+			Player::Tell($i, "That zone exists, but isn't loaded.\n");
+			return (-1);
+		}
+		else
+		{
+			Player::Tell($i, "That zone doesn't exist.\n");
+			return (-1);
+		}
+	}
+	else
+	{
+		Player::Tell($i, " Usage : zone_save [rack]\n");
+		return (-1);
+	}
+}
+
+sub Command::Zone::Load
+{
+	my $i = shift;
+	my $rack;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	$_ = shift;
+
+	exists($player->{$i}{zone_edit}) and $rack = $player->{$i}{zone_edit};
+
+	if(/^(\d+)$/ || length($rack))
+	{
+		$rack = $1;
+
+		if(Zone::Check::Exists($rack) == -1)
+		{
+			Player::Tell($i, "That zone doesn't exist in the SQL archive.\n");
+			return (-1);
+		}
+
+		if(exists($zone->{$rack}))
+		{
+			Player::Tell($i, "Zone is already loaded internally, continuing to load from SQL truncating all structural changes sine last modification.\n");
+			Makelog('zone', "Zone is already loaded internally, continuing to load from SQL truncating all structural changes sine last modification.\n");
+			delete $zone->{$rack};
+		}
+
+		Zone::Load($rack);
+
+		my $sth = $dbh->prepare("SELECT id FROM room WHERE room.zone=$rack");
+		my $r = 0;
+
+		$sth->execute;
+
+		while(my $ref = $sth->fetchrow_arrayref)
+		{
+			Room::Load($ref->[0]);
+			$r++;
+		}
+
+		$sth->finish;
+
+		Player::Tell($i, "Ok.  Loaded $r rooms.\n");
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, " Usage : zone_load <rack>\n");
+		return (-1);
+	}
+}
+
+sub Command::Zone::Unload
+{
+	my $i = shift;
+	my $rack;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	$_ = shift;
+
+	if(/^(\d+)$/)
+	{
+		$rack = $1;
+		if(exists($zone->{$rack}))
+		{
+			my $r = Zone::Save($rack);
+			my $rmod = 0;
+			my $rc = 0;
+
+			foreach my $rid (keys %{$room})
+			{
+				if($room->{$rid}{zone} == $rack)
+				{
+					$rc++;
+					$rmod += Room::Save($rid);
+					delete $room->{$rid};
+				}
+			}
+
+			Player::Tell($i, "Unloaded $rc rooms with $rmod modifications total.\n");
+			Player::Tell($i, "Zone $rack saved with $r modifications.\n");
+			delete $zone->{$rack};
+			Player::Tell($i, "Zone $rack unloaded.\n");
+			return (0);
+		}
+		elsif(Zone::Check::Exists($rack) == 0)
+		{
+			Player::Tell($i, "Zone $rack isn't loaded.\n");
+			return (-1);
+		}
+		else
+		{
+			Player::Tell($i, "That zone doesn't exist.\n");
+			return (-1);
+		}
+	}
+	else
+	{
+		Player::Tell($i, " Usage : zone_unload <rack>\n");
+		return (-1);
+	}
+}
+
+sub Command::Zone::Edit
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	$_ = shift;
+
+	unless(exists($player->{$i}{id}))
+	{
+		Player::Tell($i, "You don't exist, go away.\n");
+		return (-1);
+	}
+
+	if(/^(\d+)$/)
+	{
+		my $rack = $1;
+
+		if(Zone::Check::Exists($rack) == 0)
+		{
+			if(!(exists($zone->{$rack})))
+			{
+				Player::Tell($i, "That zone isn't loaded.\n");
+				return (-1);
+			}
+		}
+
+		if(!(exists($zone->{$rack})))
+		{
+			Player::Tell($i, "That zone doesn't exist.\n");
+			return (-1);
+		}
+
+		if($zone->{$rack}{owner} != $player->{$i}{id} && !($player->{$i}{privs} & ADMIN))
+		{
+			Player::Tell($i, "That zone isn't yours.\n");
+			return (-1);
+		}
+
+		$player->{$i}{zone_edit} = $rack;
+		Player::Tell($i, "You're now editting zone $rack.\n");
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, " Usage : zedit [rack]\n");
+		if(exists($player->{$i}{zone_edit}))
+		{
+			Player::Tell($i, "You're current editting zone $player->{$i}{zone_edit}\n");
+		}
+		return (-1);
+	}
+}
+
+sub Command::Zone::Set
+{
+	my $i = shift;
+	my $rack;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	$_ = shift;
+
+	unless(exists($player->{$i}{zone_edit}))
+	{
+		Player::Tell($i, "Set a zone to work with first.\n");
+		return (-1);
+	}
+
+	if(/^(\w+)/)
+	{
+		my $arg = $1;
+
+		if($arg eq 'owner')
+		{
+			if(/^\w+\s+(\w+)$/)
+			{
+				my $oid = Player::Get::Id($1);
+
+				if($oid == -1)
+				{
+					Player::Tell($i, "Couldn't find that person.\n");
+					return (-1);
+				}
+
+				my $owner = Player::Get::NameById($oid);
+				Player::Tell($i, "You give up the rights to zone $player->{$i}{zone_edit} to $owner.\n");
+				$zone->{$player->{$i}{zone_edit}}{owner} = $oid;
+				$zone->{$player->{$i}{zone_edit}}{dirty} = 1;
+				delete $player->{$i}{zone_edit};
+				return (0);
+			}
+			else
+			{
+				goto ZSET_USAGE;
+			}
+		}
+
+		if($arg eq 'age')
+		{
+			if(/^\w+\s+(\d+)$/)
+			{
+				my $age = $1;
+
+				$zone->{$player->{$i}{zone_edit}}{dirty} = 1;
+				$zone->{$player->{$i}{zone_edit}}{age} = $age;
+				Player::Tell($i, "Ok.\n");
+				return (0);
+			}
+			else
+			{
+				goto ZSET_USAGE;
+			}
+		}
+
+		if($arg eq 'name')
+		{
+			if(/^\w+\s+(.*)$/)
+			{
+				my $name = $1;
+
+				$zone->{$player->{$i}{zone_edit}}{dirty} = 1;
+				$zone->{$player->{$i}{zone_edit}}{name} = $name;
+				Player::Tell($i, "Ok.\n");
+				return (0);
+			}
+			else
+			{
+				goto ZSET_USAGE;
+			}
+		}
+
+		if($arg eq 'description')
+		{
+			$zone->{$player->{$i}{zone_edit}}{dirty} = 1;
+			$player->{$i}{edit_what} = \$zone->{$player->{$i}{zone_edit}}{description};
+			if(exists($zone->{$player->{$i}{zone_edit}}{description}))
+			{
+				$player->{$i}{edit_exist} = $zone->{$player->{$i}{zone_edit}}{description};
+			}
+			Editor::Start($i);
+			return (0);
+		}
+	}
+	else
+	{
+		ZSET_USAGE:
+		Player::Tell($i, " Usage : zset <key> <value>\n");
+		Player::Tell($i, "              owner\n");
+		Player::Tell($i, "              age\n");
+		Player::Tell($i, "              description\n");
+		Player::Tell($i, "              name\n");
+		return (-1);
+	}
+}
+
+
+sub Command::Zone::List
+{
+	my $i = shift;
+	my $sth = $dbh->prepare("SELECT zone,owner,creator FROM zone");
+	my $str;
+	my %list;
+
+	Player::Get::Function($i);
+	$sth->execute;
+
+	Player::Banner($i, 0, '-', "Zones that exist in $config->{'talker.name'} (on disk)");
+	Player::Tell($i, "ZONE       OWNER                CREATOR              LOADED DIRTY\n");
+
+	while(my $ref = $sth->fetchrow_arrayref)
+	{
+		length($ref->[0]) or next;
+
+		$list{$ref->[0]}{zone} = $ref->[0];
+		$list{$ref->[0]}{dirty} = 'no';
+		$list{$ref->[0]}{loaded} = 'no';
+		if(exists($zone->{$ref->[0]}))
+		{
+			$list{$ref->[0]}{loaded} = 'yes';
+			$list{$ref->[0]}{dirty} = exists($zone->{$ref->[0]}{dirty}) ? "yes" : "no";
+		}
+		else
+		{
+			$list{$ref->[0]}{dirty} = 'no';
+		}
+		$list{$ref->[0]}{owner} = Player::Get::NameById($ref->[1]);
+		$list{$ref->[0]}{creator} = Player::Get::NameById($ref->[2]);
+
+	}
+
+	$sth->finish;
+
+	foreach my $n (sort { $list{$a}{zone} <=> $list{$b}{zone} }(keys %list))
+	{
+		$str .= sprintf("%-10d %-20s %-20s %-6s %s\n", $n, $list{$n}{owner}, $list{$n}{creator}, $list{$n}{loaded}, $list{$n}{dirty});
+	}
+
+	Player::Tell($i, $str);
+
+	Player::Banner($i, 0, '-', "Zones that exist in $config->{'talker.name'} (cached and not saved)");
+	Player::Tell($i, "ZONE       OWNER                CREATOR              LOADED DIRTY\n");
+
+	$str = undef;
+
+	foreach my $z (sort { $a <=> $b }(keys %{$zone}))
+	{
+		exists($list{$z}) and next;
+		$str .= sprintf("%-10d %-20s %-20s %-6s %s\n", $z, Player::Get::NameById($zone->{$z}{owner}), Player::Get::NameById($zone->{$z}{creator}), 'yes', exists($zone->{$z}{dirty}) ? "yes" : "no");
+	}
+
+	Player::Tell($i, $str);
+	Player::Banner($i, 0, '-', undef);
+	return (0);
+}
+
+sub Command::Room::Create
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	unless($player->{$i}{id})
+	{
+		Player::Tell($i, "You don't exist, go away.\n");
+		return (-1);
+	}
+
+	$_ = shift;
+
+	if(/^([\d,\s*]+)$/)
+	{
+		my @room = split(/,/, $1);
+
+		foreach my $r (@room)
+		{
+			$r =~ s/^\s*//;
+			$r =~ s/\s*$//;
+
+			Room::Create($i, int($r));
+		}
+
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, " Usage : rcreate <rid,...>\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::Go
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	$_ = shift;
+
+	if(/^(\d+)$/)
+	{
+		my $rid = $1;
+
+		if(exists($room->{$rid}) && ($room->{$rid}{owner} == $player->{$i}{id} || $player->{$i}{privs} & ADMIN))
+		{
+			Room::Move($i, $rid);
+			return (0);
+		}
+		else
+		{
+			Player::Tell($i, "That room doesn't exist.\n");
+			return (-1);
+		}
+	}
+	else
+	{
+		Player::Tell($i, " Usage : go <rid>\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::Look
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	unless(exists($player->{$i}{room}))
+	{
+		Player::Tell($i, "You're nowhere!!\n");
+		return (-1);
+	}
+
+	unless(exists($room->{$player->{$i}{room}}))
+	{
+		Player::Tell($i, "The room around you seems to have disappeared.\n");
+		return (-1);
+	}
+
+	Player::Tell($i, "$room->{$player->{$i}{room}}{short}\n");
+	$channel = CHAN_ROOM;
+	Player::Tell($i, "$room->{$player->{$i}{room}}{description}\n\n");
+	$channel = CHAN_NORMAL;
+	foreach my $p (keys %{$player})
+	{
+		if($player->{$i}{room} == $player->{$p}{room} && $p != $i && $player->{$p}{state} & LOGGED_IN)
+		{
+			Player::Tell($i, "$player->{$p}{groundstring}\n");
+		}
+	}
+	Player::Tell($i, Room::ShowExits($player->{$i}{room}));
+	return (0);
+}
+
+sub Command::Commands
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	Player::Banner($i, 0, '-', "Command set for $player->{$i}{name}");
+
+	my @commands;
+
+	foreach my $com (keys %command)
+	{
+		if($player->{$i}{privs} & $command{$com}{priv})
+		{
+			push(@commands, $com);
+		}
+	}
+
+	my $str = join(', ', sort(@commands));
+	Player::Tell($i, "$str\n");
+	Player::Banner($i, 0, '-', undef);
+}
+
+sub Command::Room::Save
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	unless(exists($player->{$i}{room}))
+	{
+		Player::Tell($i, "But you aren't in a room!\n");
+		return (-1);
+	}
+
+	unless(exists($room->{$player->{$i}{room}}))
+	{
+		Player::Tell($i, "But the room you're standing in doesn't exist!\n");
+		return (-1);
+	}
+
+	my $mod = Room::Save($player->{$i}{room});
+	Player::Tell($i, "Saved room $player->{$i}{room} with $mod modifcations.\n");
+	return (0);
+}
+
+sub Command::Room::Load
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	$_ = shift;
+
+	if(/^(\d+)$/)
+	{
+		my $rid = $1;
+
+		if(Room::Check::Exists($rid) == -1)
+		{
+			Player::Tell($i, "That room doesn't exist.\n");
+			return (-1);
+		}
+
+		if(exists($room->{$rid}))
+		{
+			Player::Tell($i, "Room is already loaded internally, continuing to load from SQL truncating all structural changes sine last modification.\n");
+			delete $room->{$rid};
+		}
+
+		Room::Load($rid);
+		Player::Tell($i, "Ok.\n");
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, " Usage : rload <rid>\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::Unload
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	$_ = shift;
+
+	if(/^(\d+)$/)
+	{
+		my $rid = $1;
+
+		if(exists($room->{$rid}))
+		{
+			my $mod = Room::Save($rid);
+			Player::Tell($i, "Room $rid saved with $mod modifications.\n");
+			delete $room->{$rid};
+			Player::Tell($i, "Room $rid unloaded.\n");
+			return (0);
+		}
+		elsif(Room::Check::Exists($rid) == 0)
+		{
+			Player::Tell($i, "That room isn't loaded.\n");
+			return (-1);
+		}
+		else
+		{
+			Player::Tell($i, "That room doesn't exist.\n");
+			return (-1);
+		}
+	}
+	else
+	{
+		Player::Tell($i, " Usage : runload <rid>\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::List
+{
+	my $i = shift;
+	my %list;
+	my $str;
+
+	$_ = shift;
+
+	Player::Get::Function($i);
+	if(/^(\d+)$/)
+	{
+		my $zone = $1;
+
+		if(Zone::Check::Exists($zone) == -1)
+		{
+			Player::Tell($i, "That zone doesn't exist.\n");
+			return (-1);
+		}
+
+		my $sth = $dbh->prepare("SELECT id,short FROM room WHERE zone=$zone");
+		$sth->execute;
+
+		while(my $ref = $sth->fetchrow_arrayref)
+		{
+			length($ref->[0]) or next;
+
+			$list{$ref->[0]}{id} = $ref->[0];
+			$list{$ref->[0]}{short} = $ref->[1];
+			$list{$ref->[0]}{loaded} = exists($room->{$ref->[0]}) ? 'yes' : 'no';
+		}
+
+		$sth->finish;
+
+		Player::Banner($i, 0, '-', "Rooms within zone $zone (on disk)");
+		Player::Tell($i, "ZONE      RID       LOADED DIRTY NAME\n");
+
+		foreach my $r (sort { $a <=> $b }(keys %list))
+		{
+			if(exists($room->{$r}))
+			{
+				$list{$r}{dirty} = exists($room->{$r}{dirty}) ? 'yes' : 'no';
+			}
+			else
+			{
+				$list{$r}{dirty} = 'no';
+			}
+			$str .= sprintf("%-9d %-9d %-6s %-5s %s\n", $zone, $r, $list{$r}{loaded}, $list{$r}{dirty}, $list{$r}{short});
+		}
+
+		Player::Tell($i, $str);
+		Player::Banner($i, 0, '-', "Rooms within zone $zone (cached and not saved)");
+
+		$str = undef;
+
+		foreach my $r (keys %{$room})
+		{
+			exists($list{$r}) and next;
+			$room->{$r}{zone} == $zone or next;
+
+			$str .= sprintf("%-9d %-9d %-6s %-5s %s\n", $zone, $r, 'yes', 'yes', $room->{$r}{short});
+		}
+
+		Player::Tell($i, "ZONE      RID       LOADED DIRTY NAME\n");
+		Player::Tell($i, $str);
+		Player::Banner($i, 0, '-', 0);
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, " Usage : rlist <zone>\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::Set
+{
+	my $i = shift;
+
+	if(Player::Check::Structure($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	unless(exists($player->{$i}{room}))
+	{
+		Player::Tell($i, "But you aren't in a room!\n");
+		return (-1);
+	}
+
+	unless(exists($room->{$player->{$i}{room}}))
+	{
+		Player::Tell($i, "But the room you're standing in doesn't exist!\n");
+		return (-1);
+	}
+
+	my $pr = $player->{$i}{room};
+
+	$_ = shift;
+
+	if(/^short\s+(.*)$/)
+	{
+		my $short = $1;
+
+		$room->{$pr}{dirty} = 1;
+		$room->{$pr}{short} = $short;
+		Player::Tell($i, "Ok.\n");
+	}
+
+	if(/^description/)
+	{
+		$room->{$pr}{dirty} = 1;
+		$player->{$i}{edit_what} = \$room->{$pr}{description};
+		if(exists($room->{$pr}{description}))
+		{
+			$player->{$i}{edit_exist} = $room->{$pr}{description};
+		}
+		Editor::Start($i);
+		return (0);
+	}
+
+	if(/^exit/)
+	{
+		if(/^exit\s+(\w)\s+(.*)$/)
+		{
+			my $d = $1;
+			my $rid = $2;
+
+			my %dir	= (	'n',	=> 1,
+					's',	=> 2,
+					'e',	=> 3,
+					'w',	=> 4,
+					'u',	=> 5,
+					'd'	=> 6,
+				);
+
+			if(exists($dir{$d}))
+			{
+				
+				if($rid eq '-1')
+				{
+					$rid = -1;
+					return (Room::Link($i, $dir{$d}, -1));
+				}
+				else
+				{
+					return (Room::Link($i, $dir{$d}, int($rid)));
+				}
+			}
+			else
+			{
+				Player::Tell($i, "Directions are n, e, s, w, u, and d.\n");
+				return (-1);
+			}
+		}
+		else
+		{
+			goto RSET_USAGE;
+		}
+	}
+	else
+	{
+		RSET_USAGE:
+		Player::Tell($i, " Usage : rset <key> [value]\n");
+		Player::Tell($i, "               short\n");
+		Player::Tell($i, "               description\n");
+		Player::Tell($i, "               exit <n|e|s|w|u|d> <rid>\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::North
+{
+	my $i = shift;
+
+	if(Room::Move::Check($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	if(exists($room->{$room->{$player->{$i}{room}}{exit_north}}))
+	{
+		Room::Display::Move($i, $room->{$player->{$i}{room}}{exit_north}, NORTH);
+		return (Room::Move($i, $room->{$player->{$i}{room}}{exit_north}));
+	}
+	else
+	{
+		Player::Tell($i, "Alas, you cannot go that way.\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::East
+{
+	my $i = shift;
+
+	if(Room::Move::Check($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	if(exists($room->{$room->{$player->{$i}{room}}{exit_east}}))
+	{
+		Room::Display::Move($i, $room->{$player->{$i}{room}}{exit_east}, EAST);
+		return (Room::Move($i, $room->{$player->{$i}{room}}{exit_east}));
+	}
+	else
+	{
+		Player::Tell($i, "Alas, you cannot go that way.\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::West
+{
+	my $i = shift;
+
+	if(Room::Move::Check($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	if(exists($room->{$room->{$player->{$i}{room}}{exit_west}}))
+	{
+		Room::Display::Move($i, $room->{$player->{$i}{room}}{exit_west}, WEST);
+		return (Room::Move($i, $room->{$player->{$i}{room}}{exit_west}));
+	}
+	else
+	{
+		Player::Tell($i, "Alas, you cannot go that way.\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::South
+{
+	my $i = shift;
+
+	if(Room::Move::Check($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	if(exists($room->{$room->{$player->{$i}{room}}{exit_south}}))
+	{
+		Room::Display::Move($i, $room->{$player->{$i}{room}}{exit_south}, SOUTH);
+		return (Room::Move($i, $room->{$player->{$i}{room}}{exit_south}));
+	}
+	else
+	{
+		Player::Tell($i, "Alas, you cannot go that way.\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::Up
+{
+	my $i = shift;
+
+	if(Room::Move::Check($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	if(exists($room->{$room->{$player->{$i}{room}}{exit_up}}))
+	{
+		Room::Display::Move($i, $room->{$player->{$i}{room}}{exit_up}, UP);
+		return (Room::Move($i, $room->{$player->{$i}{room}}{exit_up}));
+	}
+	else
+	{
+		Player::Tell($i, "Alas, you cannot go that way.\n");
+		return (-1);
+	}
+}
+
+sub Command::Room::Down
+{
+	my $i = shift;
+
+	if(Room::Move::Check($i) == -1)
+	{
+		return (-1);
+	}
+
+	Player::Get::Function($i);
+	if(exists($room->{$room->{$player->{$i}{room}}{exit_down}}))
+	{
+		Room::Display::Move($i, $room->{$player->{$i}{room}}{exit_down}, DOWN);
+		return (Room::Move($i, $room->{$player->{$i}{room}}{exit_down}));
+	}
+	else
+	{
+		Player::Tell($i, "Alas, you cannot go that way.\n");
+		return (-1);
+	}
+}
+
+sub Command::Communication::Think
+{
+	my ($p, $str) = @_;
+
+	$_ = $str;
+	s/^\s+//;
+	s/\s+$//;
+	Player::Get::Function($p);
+
+	if(/^example$/i)
+	{
+		Player::Tell($p, " Example : think i have to stop thinking to myself\n");
+		return;
+	}
+	elsif(/\w/ || /\d/ || /\W/)
+	{
+		Room::Tell($player->{$p}{room}, $p, "- $player->{$p}{name} thinks .  o O ( $str )\n");
+		Player::Tell($p, "You think . o O ( $str )^N\n");
+	}
+	else
+	{
+		Player::Tell($p, " Usage : think [thought|example]\n");
+	}
+	return;
+}
+
+sub Command::Communication::Say
+{
+	my $p = shift;
+	$_ = shift;
+
+	s/^\s*//;
+	s/\s*$//;
+	chomp;
+
+	Player::Get::Function($p);
+	if(/^example$/i)
+	{
+		Player::Tell($p, " Example : say hello, world!\n");
+		return;
+	}
+	elsif(/\w/ || /\d/ || /\W/)
+	{
+		my $str = $_;
+		(my $mstr, my $pstr) = Make::String::Public($str);
+		Room::Tell($player->{$p}{room}, $p, "- $player->{$p}{name} $mstr, '$_'\n");
+		Player::Tell($p, "You $pstr, '$str^N'\n");
+	}
+	else
+	{
+		Player::Tell($p, " Usage : say [message|example]\n");
+	}
+	return;
+}
+
+sub Command::Communication::Echo
+{
+	my ($p, $str) = @_;
+
+	$_ = $str;
+	s/^\s+//;
+	s/\s+$//;
+
+	Player::Get::Function($p);
+	if(/^example$/i)
+	{
+		Player::Tell($p, " Example : echo hoot hoot!\n");
+		return (0);
+	}
+	elsif(/\w/ || /\d/ || /\W/)
+	{
+		Room::Tell($player->{$p}{room}, $p, "+ $str\n", CHAN_ECHO);
+		Player::Tell($p, "You echo: $str^N\n");
+		return (0);
+	}
+	else
+	{
+		Player::Tell($p, " Usage : echo [example]|<message>\n");
+		return (-1);
+	}
+}
+
+sub Command::Communication::Emote
+{
+	my ($p, $str) = @_;
+
+	$_ = $str;
+	s/^\s+//;
+	s/\s+$//;
+
+	Player::Get::Function($p);
+	if(/^example$/i)
+	{
+		Player::Tell($p, " Example : emote smiles!\n");
+		Player::Tell($p, " Example : emote 's mouth drops!\n");
+		return (0);
+	}
+	elsif(/^'(.*)\s+(.*)$/)
+	{
+		my $p = $1;
+		my $s = $2;
+
+		Room::Tell($player->{$p}{room}, $p, "- $player->{$p}{name}'$p $s\n");
+		Player::Tell($p, "You emote `$player->{$p}{name}'$p $s'^N\n");
+		return (0);
+	}
+	elsif(/\w/ || /\d/ || /\W/)
+	{
+		my $str = $_;
+		Room::Tell($player->{$p}{room}, $p, "- $player->{$p}{name} $str\n");
+		Player::Tell($p, "You emote `$player->{$p}{name} $str'^N\n");
+		return (0);
+	}
+	else
+	{
+		Player::Tell($p, " Usage : emote [emotion|'literal emotion|example]\n");
+	}
+	return;
+}
+
+
+sub Communication::Pre
+{
+	my $p = shift;
+	my $arg = shift;
+	my @sync;
+
+	Player::Get::Function($p);
+	(my $list, my $error) = Find::Player($p, $arg);
+
+	foreach my $dude (@{$error})
+	{
+		length($dude) or next;
+
+		$channel = CHAN_CUSTOM;
+		Player::Tell($p, $dude);
+		$channel = CHAN_NORMAL;
+	}
+
+	foreach my $dude (keys %{$list})
+	{
+		if(ref($$list{$dude}) eq 'ARRAY')
+		{
+			my @mm;
+			foreach my $mm (@{$$list{$dude}})
+			{
+				push(@mm, $player->{$mm}{name});
+			}
+			my $mm = join(', ', @mm);
+
+			Player::Tell($p, "Multiple matches: ($dude) $mm\n");
+		}
+		elsif($p eq $$list{$dude})
+		{
+			Player::Tell($p, "`$player->{$p}{name}' is you, spoon!!\n");
+		}
+		elsif(!(length($dude)))
+		{
+			$channel = CHAN_CUSTOM;
+			Player::Tell($p, "Bad syntax\n");
+			$channel = CHAN_NORMAL;
+		}
+		else
+		{
+			push(@sync, $$list{$dude});
+		}
+	}
+	return (@sync);
+}
+
+sub Command::Communication::Tell
+{
+	my $p = shift;
+	my $str = shift;
+	my $arg = undef;
+	my $msg = undef;
+	my @sync;
+
+	$_ = $str;
+
+	Player::Get::Function($p);
+	if(/([\w\.\?\*\d\$,]+)\s+(.*)$/)
+	{
+		$arg = $1;
+		$msg = $2;
+	}
+	elsif(/([\w\.\?\*\d\$]+)\s+(.*)$/)
+	{
+		$arg = $1;
+		$msg = $2;
+	}
+	else
+	{
+		Player::Tell($p, " Usage : tell [(player|regexp),...]+ [msg]\n");
+		return;
+	}
+
+	@sync = Communication::Pre($p, $arg);
+
+	Communication($p, 'tell', $msg, @sync);
+}
+
+sub Command::Communication::Remote
+{
+	my $p = shift;
+	my $str = shift;
+	my $arg = undef;
+	my $msg = undef;
+	my @sync;
+
+	$_ = $str;
+
+	Player::Get::Function($p);
+	if(/([\w\.\?\*\d\$,]+)\s+(.*)$/)
+	{
+		$arg = $1;
+		$msg = $2;
+	}
+	elsif(/([\w\.\?\*\d\$]+)\s+(.*)$/)
+	{
+		$arg = $1;
+		$msg = $2;
+	}
+	else
+	{
+		Player::Tell($p, " Usage : remote [(player|regexp),...]+ [emotion]\n");
+		return;
+	}
+
+	@sync = Communication::Pre($p, $arg);
+
+	Communication($p, 'remote', $msg, @sync);
+}
+
+sub Command::Communication::Rthink
+{
+	my $p = shift;
+	my $str = shift;
+	my $arg = undef;
+	my $msg = undef;
+	my @sync;
+
+	$_ = $str;
+
+	Player::Get::Function($p);
+	if(/([\w\.\?\*\d\$,]+)\s+(.*)$/)
+	{
+		$arg = $1;
+		$msg = $2;
+	}
+	elsif(/([\w\.\?\*\d\$]+)\s+(.*)$/)
+	{
+		$arg = $1;
+		$msg = $2;
+	}
+	else
+	{
+		Player::Tell($p, " Usage : rthink [(player|regexp),...]+ [thought]\n");
+		return;
+	}
+
+	@sync = Communication::Pre($p, $arg);
+
+	Communication($p, 'rthink', $msg, @sync);
+}
+
+sub Communication
+{
+	my $p = shift;
+	my $type = shift;
+	my $msg = shift;
+	my @list = @_;
+	my $count = scalar(@list);
+
+	(my $mstr, my $pstr) = Make::String($msg);
+
+	if($count == 1)
+	{
+		my $luser = shift(@list);
+
+		if($player->{$luser}{state} & ZOMBIE)
+		{
+			Player::Tell($p, "^H(note:  $player->{$luser}{name} is link-dead.)^N\n");
+		}
+
+		if($type eq 'tell')
+		{
+			$channel = CHAN_TELL;
+			Player::Tell($luser, "> $player->{$p}{name} $mstr you, '$msg'\n");
+			$channel = CHAN_NORMAL;
+
+			Player::Tell($p, "You $pstr $player->{$luser}{name}, '$msg'^N\n");
+			$player->{$luser}{reply} = $player->{$p}{name};
+			return (0);
+		}
+		elsif($type eq 'remote')
+		{
+			$channel = CHAN_TELL;
+			Player::Tell($luser, "> $player->{$p}{name} $msg\n");
+			$channel = CHAN_NORMAL;
+
+			Player::Tell($p, "You emote `$player->{$p}{name} $msg'^N to $player->{$luser}{name}.\n");
+			$player->{$luser}{reply} = $player->{$p}{name};
+			return (0);
+		}
+		if($type eq 'rthink')
+		{
+			$channel = CHAN_TELL;
+			Player::Tell($luser, "> $player->{$p}{name} thinks . o o ( $msg )\n");
+			$channel = CHAN_NORMAL;
+
+			Player::Tell($p, "You think . o O ( $msg^N ) to $player->{$luser}{name}.\n");
+			$player->{$luser}{reply} = $player->{$p}{name};
+			return (0);
+		}
+	}
+	elsif($count == 2)
+	{
+		my $first = shift(@list);
+		my $second = shift(@list);
+
+		if($player->{$first}{state} & ZOMBIE)
+		{
+			Player::Tell($p, "^H(note:  $player->{$first}{name} is link-dead.)^N\n");
+		}
+		if($player->{$second}{state} & ZOMBIE)
+		{
+			Player::Tell($p, "^H(note:  $player->{$second}{name} is link-dead.)^N\n");
+		}
+
+		if($type eq 'tell')
+		{
+			$channel = CHAN_TELL;
+			Player::Tell($first, "&> $player->{$p}{name} $mstr you and $player->{$second}{name}, '$msg'\n");
+			Player::Tell($second, "&> $player->{$p}{name} $mstr you and $player->{$first}{name}, '$msg'\n");
+			$channel = CHAN_NORMAL;
+
+			Player::Tell($p, "You $pstr $player->{$first}{name} and $player->{$second}{name}, '$msg'^N\n");
+			$player->{$first}{reply} = "$player->{$p}{name},$player->{$second}{name}";
+			$player->{$second}{reply} = "$player->{$p}{name},$player->{$first}{name}";
+		}
+		elsif($type eq 'remote')
+		{
+			$channel = CHAN_TELL;
+			Player::Tell($first, "&> $player->{$p}{name} $msg^N (to you and $player->{$second}{name})\n");
+			Player::Tell($first, "&> $player->{$p}{name} $msg^N (to you and $player->{$first}{name})\n");
+			$channel = CHAN_NORMAL;
+
+			Player::Tell($p, "You emote `$player->{$p}{name} $msg'^N to $player->{$first}{name} and $player->{$second}{name}.\n");
+			$player->{$first}{reply} = "$player->{$p}{name},$player->{$second}{name}";
+			$player->{$second}{reply} = "$player->{$p}{name},$player->{$first}{name}";
+		}
+		elsif($type eq 'rthink')
+		{
+			$channel = CHAN_TELL;
+			Player::Tell($first, "&> $player->{$p}{name} thinks . o O ( $msg H)^N (to you and $player->{$second}{name})\n");
+			Player::Tell($second, "&> $player->{$p}{name} thinks . o O ( $msg H)^N (to you and $player->{$first}{name})\n");
+			$channel = CHAN_NORMAL;
+
+
+			Player::Tell($p, "You think . o O ( $msg^N ) to $player->{$first}{name} and $player->{$second}{name}.\n");
+			$player->{$first}{reply} = "$player->{$p}{name},$player->{$second}{name}";
+			$player->{$second}{reply} = "$player->{$p}{name},$player->{$first}{name}";
+		}
+	}
+	elsif($count > 2)
+	{
+
+		if($type eq 'tell')
+		{
+			foreach my $dude (@list)
+			{
+				my @rep;
+
+				foreach my $dude2 (@list)
+				{
+					if($dude != $dude2)
+					{
+						push(@rep, $dude2);
+					}
+				}
+
+				my $last = pop(@rep);
+				$last = $player->{$last}{name};
+
+				my $list;
+				my @dup;
+
+				foreach my $sucker (@rep)
+				{
+					push(@dup, $player->{$sucker}{name});
+				}
+
+				$list = join(', ', @dup);
+
+				if($player->{$dude}{state} & ZOMBIE)
+				{
+					Player::Tell($p, "^H(note:  $player->{$dude}{name} is link-dead.)^N\n");
+				}
+
+				$channel = CHAN_TELL;
+				Player::Tell($dude, "+> $player->{$p}{name} $mstr you, $list and $last, '$msg'\n");
+				$channel = CHAN_NORMAL;
+
+				$player->{$dude}{reply} = "$player->{$p}{name},$list,$last";
+			}
+
+			my @dup;
+			my $last = pop(@list);
+			$last = $player->{$last}{name};
+			my $list;
+
+			foreach my $p2 (@list)
+			{
+				push(@dup, $player->{$p2}{name});
+			}
+
+			$list = join(', ', @dup);
+
+			Player::Tell($p, "You $pstr $list and $last, '$msg^N'\n");
+		}
+		elsif($type eq 'remote')
+		{
+			foreach my $dude (@list)
+			{
+				my @rep;
+
+				foreach my $dude2 (@list)
+				{
+					if($dude != $dude2)
+					{
+						push(@rep, $dude2);
+					}
+				}
+
+				my $last = pop(@rep);
+				$last = $player->{$last}{name};
+
+				my $list;
+				my @dup;
+
+				foreach my $sucker (@rep)
+				{
+					push(@dup, $player->{$sucker}{name});
+				}
+
+				$list = join(', ', @dup);
+
+				if($player->{$dude}{state} & ZOMBIE)
+				{
+					Player::Tell($p, "^H(note:  $player->{$dude}{name} is link-dead.)^N\n");
+				}
+
+				$channel = CHAN_TELL;
+				Player::Tell($dude, "+> $player->{$p}{name} $msg^N (to you, $list and $last)\n");
+				$channel = CHAN_NORMAL;
+				$player->{$dude}{reply} = "$player->{$p}{name},$list,$last";
+			}
+
+			my @dup;
+			my $last = pop(@list);
+			$last = $player->{$last}{name};
+			my $list;
+
+			foreach my $p2 (@list)
+			{
+				push(@dup, $player->{$p2}{name});
+			}
+
+			$list = join(', ', @dup);
+
+			Player::Tell($p, "You emote `$player->{$p}{name} $msg^N' to $list and $last.\n");
+		}
+		elsif($type eq 'rthink')
+		{
+			foreach my $dude (@list)
+			{
+				my @rep;
+
+				foreach my $dude2 (@list)
+				{
+					if($dude != $dude2)
+					{
+						push(@rep, $dude2);
+					}
+				}
+
+				my $last = pop(@rep);
+				$last = $player->{$last}{name};
+
+				my $list;
+				my @dup;
+
+				foreach my $sucker (@rep)
+				{
+					push(@dup, $player->{$sucker}{name});
+				}
+
+				if($player->{$dude}{state} & ZOMBIE)
+				{
+					Player::Tell($p, "^H(note:  $player->{$dude}{name} is link-dead.)^N\n");
+				}
+
+				$channel = CHAN_TELL;
+				Player::Tell($dude, "+> $player->{$p}{name} thinks . o O ( $msg )^N (to you, $list and $last)\n");
+				$channel = CHAN_NORMAL;
+				$list = join(', ', @dup);
+
+				$player->{$dude}{reply} = "$player->{$p}{name},$list,$last";
+			}
+
+			my @dup;
+			my $last = pop(@list);
+			$last = $player->{$last}{name};
+			my $list;
+
+			foreach my $p2 (@list)
+			{
+				push(@dup, $player->{$p2}{name});
+			}
+
+			$list = join(', ', @dup);
+
+			Player::Tell($p, "You think . o O ( $msg^N ) to $list and $last.\n");
+		}
+	}
+}
+
+sub Command::Communication::ReplyRemote
+{
+	my $p = shift;
+
+	Player::Get::Function($p);
+	$_ = shift;
+
+	s/^\s*//;
+	s/\s*$//;
+	unless(/\S/)
+	{
+		Player::Tell($p, " Usage : [ [message]\n");
+		if(length($player->{$p}{reply}))
+		{
+			Player::Tell($p, " Your reply buffer contains: $player->{$p}{reply}\n");
+		}
+		else
+		{
+			Player::Tell($p, " Your reply buffer is empty\n");
+		}
+		return;
+	}
+	unless(length($player->{$p}{reply}))
+	{
+		Player::Tell($p, " Your reply buffer is empty\n");
+		return;
+	}
+	Command::Communication::Remote($p, "$player->{$p}{reply} $_");
+	return;
+}
+
+sub Command::Communication::ReplyTell
+{
+	my $p = shift;
+
+	Player::Get::Function($p);
+	$_ = shift;
+
+	s/^\s*//;
+	s/\s*$//;
+	unless(/\S/)
+	{
+		Player::Tell($p, " Usage : reply [message]\n");
+		if(length($player->{$p}{reply}))
+		{
+			Player::Tell($p, " Your reply buffer contains: $player->{$p}{reply}\n");
+		}
+		else
+		{
+			Player::Tell($p, " Your reply buffer is empty\n");
+		}
+		return;
+	}
+	unless(length($player->{$p}{reply}))
+	{
+		Player::Tell($p, " Your reply buffer is empty\n");
+		return;
+	}
+	Command::Communication::Tell($p, "$player->{$p}{reply} $_");
+	return;
+}
+
+sub Command::Change::Color
+{
+	my $i = shift;
+	my $str = shift;
+	my %out = (	0	=> 'N',
+			1	=> 'r',
+			2	=> 'g',
+			3	=> 'y',
+			4	=> 'b',
+			5	=> 'p',
+			6	=> 'c',
+			7	=> 'A',
+			8	=> 'a',
+			9	=> 'R',
+			10	=> 'G',
+			11	=> 'Y',
+			12	=> 'B',
+			13	=> 'P',
+			14	=> 'C',
+			15	=> 'W',
+			16	=> 'H',
+			17	=> 'U',
+			18	=> 'V',
+			19	=> 'F',
+			20	=> 'K',
+		);
+	my %channel = (	'channel_room',		=> 1,
+			'channel_shout',	=> 1,
+			'channel_tell',		=> 1,
+			'channel_friend',	=> 1,
+			'channel_echo',		=> 1,
+			'channel_session',	=> 1,
+			'channel_su',		=> 1,
+			'channel_admin',	=> 1,
+			'channel_custom',	=> 1,
+			'channel_hilite',	=> 1,
+		);
+	my %color = (	'normal',	=> 0,
+			'red',		=> 1,
+			'green',	=> 2,
+			'brown',	=> 3,
+			'blue',		=> 4,
+			'purple',	=> 5,
+			'cyan',		=> 6,
+			'lightgray',	=> 7,
+			'darkgray',	=> 8,
+			'brightred',	=> 9,
+			'brightgreen',	=> 10,
+			'yellow',	=> 11,
+			'brightblue',	=> 12,
+			'brightpurple',	=> 13,
+			'brightcyan',	=> 14,
+			'white',	=> 15,
+			'bold',		=> 16,
+			'underline',	=> 17,
+			'reverse',	=> 18,
+			'faint',	=> 19,
+			'black',	=> 20,
+		);
+
+	Player::Get::Function($i);
+	$_ = $str;
+
+	if(/^list/)
+	{
+		Player::Banner($i, 0, '-', "Available colors are");
+
+		my $tmp;
+
+		foreach my $c (sort(keys(%color)))
+		{
+			$tmp .= "^$out{$color{$c}}$c^N, ";
+		}
+
+		Player::Tell($i, "$tmp\n");
+		Player::Banner($i, 0, '-', undef);
+		return (0);
+	}
+	elsif(/^(\w+)\s+(\w+)$/)
+	{
+		my $type = 'channel_';
+		$type .= $1;
+		my $range = $2;
+
+		if(exists($channel{$type}))
+		{
+			if(exists($color{$range}))
+			{
+				$player->{$i}{$type} = $color{$range};
+				Player::Tell($i, "Set $type to $range.\n");
+				return (0);
+			}
+			else
+			{
+				Player::Tell($i, "Couldn't find that color.\n");
+				return (-1);
+			}
+		}
+	}
+
+	foreach my $c (keys %channel)
+	{
+		my $tmp = $player->{$i}{$c};
+		foreach my $co (keys %color)
+		{
+			if($color{$co} == $tmp)
+			{
+				$c =~ s/channel_//;
+				my $str = sprintf("%-20s = %s.\n", $c, "^$out{$tmp}$co^N");
+				Player::Tell($i, $str);
+			}
+		}
+	}
+
+	Player::Tell($i, " Usage : cset [list]|<channel> <color>\n");
+	return (-1);
+}
+
+sub Command::List::Color
+{
+	my $i = shift;
+
+	Command::Change::Color($i, 'list');
+	return (0);
+}
+
+sub Command::List::List
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+
+	my %list;
+
+	foreach my $l (@{$player->{$i}{list_bar}})
+	{
+		$list{Player::Get::NameById($l)}{bar} = 'YES';
+	}
+
+	foreach my $l (@{$player->{$i}{list_beep}})
+	{
+		$list{Player::Get::NameById($l)}{beep} = 'YES';
+	}
+
+	foreach my $l (@{$player->{$i}{list_block}})
+	{
+		$list{Player::Get::NameById($l)}{block} = 'YES';
+	}
+
+	foreach my $l (@{$player->{$i}{list_friend}})
+	{
+		$list{Player::Get::NameById($l)}{friend} = 'YES';
+	}
+
+	foreach my $l (@{$player->{$i}{list_grab}})
+	{
+		$list{Player::Get::NameById($l)}{grab} = 'YES';
+	}
+
+	foreach my $l (@{$player->{$i}{list_ignore}})
+	{
+		$list{Player::Get::NameById($l)}{ignore} = 'YES';
+	}
+
+	foreach my $l (@{$player->{$i}{list_inform}})
+	{
+		$list{Player::Get::NameById($l)}{inform} = 'YES';
+	}
+
+	foreach my $l (@{$player->{$i}{list_invite}})
+	{
+		$list{Player::Get::NameById($l)}{invite} = 'YES';
+	}
+
+	foreach my $l (@{$player->{$i}{list_mblock}})
+	{
+		$list{Player::Get::NameById($l)}{mblock} = 'YES';
+	}
+
+	foreach my $l (@{$player->{$i}{list_noisy}})
+	{
+		$list{Player::Get::NameById($l)}{noisy} = 'YES';
+	}
+
+	Player::Banner($i, 0, '-', "List for $player->{$i}{name}");
+	Player::Tell($i, "Name                Bar Bep Blk Frn Grb Ign Inf Inv Mlk Nsy\n");
+	if($player->{$i}{flags} & INFORM_ALL)
+	{
+		Player::Tell($i, "everyone                                    YES\n");
+	}
+
+	my $str;
+
+	foreach my $l (sort(keys %list))
+	{
+		$str .= sprintf("%-19s %-3s %-3s %-3s %-3s %-3s %-3s %-3s %-3s %-3s %-3s\n", $l,
+			$list{$l}{bar}, $list{$l}{beep}, $list{$l}{block}, $list{$l}{friend},
+			$list{$l}{grab}, $list{$l}{ignore}, $list{$l}{inform}, $list{$l}{invite},
+			$list{$l}{mblock}, $list{$l}{noisy});
+	}
+
+	Player::Tell($i, $str);
+	Player::Banner($i, 0, '-', undef);
+
+	return (0);
+}
+
+sub Command::List::Set
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+
+	my %list = (	'bar'		=> 'list_bar',
+			'beep',		=> 'list_beep',
+			'block',	=> 'list_block',
+			'friend',	=> 'list_friend',
+			'grab',		=> 'list_grab',
+			'ignore',	=> 'list_ignore',
+			'inform',	=> 'list_inform',
+			'invite',	=> 'list_invite',
+			'mblock',	=> 'list_mblock',
+			'noisy',	=> 'list_noisy',
+		);
+
+	$_ = shift;
+
+	if(/^(\w+)\s+(\w+)$/)
+	{
+		my $type = $1;
+		my $person = $2;
+
+		if(exists($list{$type}))
+		{
+			my $id = Player::Get::Id($person);
+
+			if($person eq 'everyone')
+			{
+				if($type eq 'inform')
+				{
+					$player->{$i}{flags} ^= INFORM_ALL;
+					if($player->{$i}{flags} & INFORM_ALL)
+					{
+						Player::Tell($i, "You will be informed of all logins.\n");
+					}
+					else
+					{
+						Player::Tell($i, "You will not be informed of all logins.\n");
+					}
+					return (0);
+				}
+				else
+				{
+					Player::Tell($i, "You can only toggle 'everyone' within the inform list.\n");
+					return (-1);
+				}
+			}
+
+			if($id == -1)
+			{
+				Player::Tell($i, "That person doesn't exist.\n");
+				return (-1);
+			}
+
+			foreach my $m (@{$player->{$i}{$list{$type}}})
+			{
+				if($m == $id)
+				{
+					Player::Tell($i, "You remove $person from your $type list.\n");
+
+					my @tmp;
+					foreach my $d (@{$player->{$i}{$list{$type}}})
+					{
+						if($d != $id)
+						{
+							push(@tmp, $d);
+						}
+					}
+
+					$player->{$i}{$list{$type}} = \@tmp;
+					return (0);
+				}
+			}
+
+			push(@{$player->{$i}{$list{$type}}}, $id);
+			Player::Tell($i, "You add $person to your $type list.\n");
+		}
+		else
+		{
+			Player::Tell($i, "Can't find that list type.\n");
+			return (-1);
+		}
+	}
+	else
+	{
+		Player::Tell($i, " Usage : lset <list type> <person>\n");
+		Player::Tell($i, " List types are: ");
+		Player::Tell($i, join(', ', sort(keys %list)), "\n");
+		return (-1);
+	}
+}
+
+sub Command::Redo
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+	$_ = shift;
+
+	if(/^\@/)
+	{
+		Player::Tell($i, "Let's not create a paradox, ok?\n");
+		return (-1);
+	}
+	elsif(/^(\S.*)$/)
+	{
+		my $com = $1;
+
+		Socket::Process::Command($i, "$com $player->{$i}{redo}");
+		delete $player->{$i}{input};
+		return (-1);
+	}
+	else
+	{
+		Player::Tell($i, "Command redo contains the arguements: $player->{$i}{redo}\n");
+		return (-1);
+	}
+}
+
+sub Command::List::Friends
+{
+	my $i = shift;
+	my @fnd;
+
+
+	Player::Get::Function($i);
+	foreach my $item (@{$player->{$i}{list_friend}})
+	{
+		foreach my $p (keys %{$player})
+		{
+			if($player->{$p}{id} == $item)
+			{
+				push(@fnd, $player->{$p}{name});
+			}
+		}
+	}
+
+	if(scalar(@fnd))
+	{
+		Player::Tell($i, 'You have ', Make::Word::Number(scalar(@fnd)), scalar(@fnd) == 1 ? " friend" : " friends", " on at the moment.\n", join(', ', @fnd), "\n");
+	}
+	else
+	{
+		Player::Tell($i, "None of your friends are on at the moment.\n");
+	}
+	return (0);
+}
+
+sub Command::Version
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+	Player::Tell($i, $config->{file}{'version'});
+	return (0);
+}
+
+sub Command::Admin::Reload
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+
+	$_ = shift;
+
+	if(/^help/i)
+	{
+		%{$help} = {};
+		Initiate::Help();
+		SU::Wall("-=> $player->{$i}{name} reloads the help files.\n");
+		return (0);
+	}
+	elsif(/^files/)
+	{
+		delete $config->{file};
+		Initiate::Files();
+		SU::Wall("-=> $player->{$i}{name} reloads lib/files/*\n");
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, " Usage : reload <help|files>\n");
+		return (-1);
+	}
+}
+
+sub Command::Admin::Remove
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+
+	$_ = shift;
+
+	my %list = (	'newbie',		=> (1<<0),
+			'resident',		=> (1<<1),
+			'mail',			=> (1<<2),
+			'news',			=> (1<<3),
+			'session',		=> (1<<4),
+			'builder',		=> (1<<5),
+			'sethboy',		=> (1<<10),
+			'psu',			=> (1<<11),
+			'su',			=> (1<<12),
+			'asu',			=> (1<<13),
+			'lower_admin',		=> (1<<14),
+			'admin',		=> (1<<15),
+			'coder',		=> (1<<16),
+			'hcadmin',		=> (1<<17),
+		);
+
+	if(/^list/i)
+	{
+		Player::Banner($i, 0, '-', 'Privileges you are allowed to remove');
+
+		foreach my $key (sort(keys %list))
+		{
+			if($player->{$i}{privs} & $list{$key})
+			{
+				Player::Tell($i, " ) $key\n");
+			}
+		}
+
+		Player::Banner($i, 0, '-', undef);
+		return (0);
+	}
+	elsif(/^(\w+)\s+(\w+)$/)
+	{
+		my $dude = $1;
+		my $t = $2;
+		my $id;
+
+		if(exists($list{$t}) && $player->{$i}{privs} & $list{$t})
+		{
+			foreach my $p (keys %{$player})
+			{
+				if($player->{$p}{name} eq $dude)
+				{
+					$id = $p;
+				}
+			}
+
+			unless(length($id))
+			{
+				Player::Tell($i, "Couldn't find that player.\n");
+				return (-1);
+			}
+
+			Player::Tell($id, " ^H-=> $player->{$i}{name} has removed $t from you.\n");
+			$player->{$id}{privs} &= ~$list{$t};
+			Admin::Wall("-=> $player->{$i}{name} removes $t from $dude ($player->{$id}{privs}).\n");
+			Command::Save($id);
+			return (0);
+		}
+		else
+		{
+			Player::Tell($i, "Couldn't find that privilege.  See `remove list' for a list.\n");
+			return (0);
+		}
+	}
+	else
+	{
+		Player::Tell($i, " Usage : remove [list]|<player> <privilege>\n");
+		return (0);
+	}
+}
+
+sub Command::Admin::Grant
+{
+	my $i = shift;
+
+	Player::Get::Function($i);
+
+	$_ = shift;
+
+	my %list = (	'newbie',		=> (1<<0),
+			'resident',		=> (1<<1),
+			'mail',			=> (1<<2),
+			'news',			=> (1<<3),
+			'session',		=> (1<<4),
+			'builder',		=> (1<<5),
+			'sethboy',		=> (1<<10),
+			'psu',			=> (1<<11),
+			'su',			=> (1<<12),
+			'asu',			=> (1<<13),
+			'lower_admin',		=> (1<<14),
+			'admin',		=> (1<<15),
+			'coder',		=> (1<<16),
+			'hcadmin',		=> (1<<17),
+		);
+
+	if(/^list/i)
+	{
+		Player::Banner($i, 0, '-', 'Privileges you are allowed to grant');
+
+		foreach my $key (sort(keys %list))
+		{
+			if($player->{$i}{privs} & $list{$key})
+			{
+				Player::Tell($i, " ) $key\n");
+			}
+		}
+
+		Player::Banner($i, 0, '-', undef);
+		return (0);
+	}
+	elsif(/^(\w+)\s+(\w+)$/)
+	{
+		my $dude = $1;
+		my $t = $2;
+		my $id;
+
+		if(exists($list{$t}) && $player->{$i}{privs} & $list{$t})
+		{
+			foreach my $p (keys %{$player})
+			{
+				if($player->{$p}{name} eq $dude)
+				{
+					$id = $p;
+				}
+			}
+
+			unless(length($id))
+			{
+				Player::Tell($i, "Couldn't find that player.\n");
+				return (-1);
+			}
+
+			Player::Tell($id, " ^H-=> $player->{$i}{name} has granted you $t.\n");
+			$player->{$id}{privs} |= $list{$t};
+			Admin::Wall("-=> $player->{$i}{name} grants $dude $t ($player->{$id}{privs}).\n");
+			Command::Save($id);
+			return (0);
+		}
+		else
+		{
+			Player::Tell($i, "Couldn't find that privilege.  See `grant list' for a list.\n");
+			return (0);
+		}
+	}
+	else
+	{
+		Player::Tell($i, " Usage : grant [list]|<player> <privilege>\n");
+		return (0);
+	}
+}
+
+sub Command::List::Privs
+{
+	my $i = shift;
+	my $str;
+
+	Player::Banner($i, 0, '-', 'Privileges available to you');
+
+	$str .= "You are a resident.\n" if($player->{$i}{privs} & RESIDENT);
+	$str .= "You can send mail.\n" if($player->{$i}{privs} & MAIL);
+	$str .= "You can post news.\n" if($player->{$i}{privs} & NEWS);
+	$str .= "You can change sessions.\n" if($player->{$i}{privs} & SESSION);
+	$str .= "You can create rooms.\n" if($player->{$i}{privs} & BUILDER);
+	$str .= "You are a pseudo-super-user.\n" if($player->{$i}{privs} & PSU);
+	$str .= "You are a super-user.\n" if($player->{$i}{privs} & SU);
+	$str .= "You are an advaned-super-user.\n" if($player->{$i}{privs} & ASU);
+	$str .= "You are a lower administrator.\n" if($player->{$i}{privs} & LOWER_ADMIN);
+	$str .= "You are an administrator.\n" if($player->{$i}{privs} & ADMIN);
+	$str .= "You are a hard-coded administrator.\n" if($player->{$i}{privs} & HCADMIN);
+	$str .= "You are a coder.\n" if($player->{$i}{privs} & CODER);
+
+	Player::Tell($i, $str);
+	Player::Banner($i, 0, '-', undef);
+
+	return (0);
+}
+
+sub Command::SU::Who
+{
+	my $p = shift;
+
+	Player::Banner($p, 0, '-', "Super Users listening");
+
+	foreach my $p2 (keys %{$player})
+	{
+		if($player->{$p2}{privs} >= PSU)
+		{
+			Player::Tell($p, " + $player->{$p2}{name}\n");
+		}
+	}
+
+	Player::Banner($p, 0, '-', undef);
+	return (0);
+}
+
+sub Command::SU::Say
+{
+	my $p = shift;
+	my $str = shift;
+
+	unless(length($str))
+	{
+		Player::Tell($p, " Usage : su [msg]\n");
+		return (-1);
+	}
+
+	(my $mstr, my $pstr) = Make::String::Public($str);
+
+	$channel = CHAN_SU;
+	SU::Wall("[SU] $player->{$p}{name} $mstr, '$str'\n");
+	$channel = CHAN_NORMAL;
+	return (0);
+}
+
+sub Command::SU::Emote
+{
+	my $p = shift;
+	my $str = shift;
+
+	unless(length($str))
+	{
+		Player::Tell($p, " Usage : se [emotion]\n");
+		return (-1);
+	}
+
+	$channel = CHAN_SU;
+	SU::Wall("[SU] $player->{$p}{name} $str^N\n");
+	$channel = CHAN_NORMAL;
+	return (0);
+}
+
+sub Command::SU::Think
+{
+	my $p = shift;
+	my $str = shift;
+
+	unless(length($str))
+	{
+		Player::Tell($p, " Usage : st [thought]\n");
+		return (-1);
+	}
+
+	$channel = CHAN_SU;
+	SU::Wall("[SU] $player->{$p}{name} thinks . o O ( $str )\n");
+	$channel = CHAN_NORMAL;
+	return (0);
+}
+
+sub Command::Admin::Who
+{
+	my $p = shift;
+
+	Player::Banner($p, 0, '-', "Administrators listening");
+
+	foreach my $p2 (keys %{$player})
+	{
+		if($player->{$p2}{privs} >= ADMIN)
+		{
+			Player::Tell($p, " + $player->{$p2}{name}\n");
+		}
+	}
+
+	Player::Banner($p, 0, '-', undef);
+	return (0);
+}
+
+sub Command::Admin::Say
+{
+	my $p = shift;
+	my $str = shift;
+
+	unless(length($str))
+	{
+		Player::Tell($p, " Usage : ad [msg]\n");
+		return (-1);
+	}
+
+	(my $mstr, my $pstr) = Make::String::Public($str);
+
+	$channel = CHAN_ADMIN;
+	Admin::Wall("[AD] $player->{$p}{name} $mstr, '$str'\n");
+	$channel = CHAN_NORMAL;
+	return (0);
+}
+
+sub Command::Admin::Emote
+{
+	my $p = shift;
+	my $str = shift;
+
+	unless(length($str))
+	{
+		Player::Tell($p, " Usage : ae [emotion]\n");
+		return (-1);
+	}
+
+	$channel = CHAN_ADMIN;
+	Admin::Wall("[AD] $player->{$p}{name} $str\n");
+	$channel = CHAN_NORMAL;
+	return;
+}
+
+sub Command::Admin::Think
+{
+	my $p = shift;
+	my $str = shift;
+
+	unless(length($str))
+	{
+		Player::Tell($p, " Usage : at [thought]\n");
+		return (-1);
+	}
+
+	$channel = CHAN_ADMIN;
+	Admin::Wall("[AD] $player->{$p}{name} thinks . o O ( $str )\n");
+	$channel = CHAN_NORMAL;
+	return;
+}
+
+sub Command::Custom::Say
+{
+	my $p = shift;
+	my $str = shift;
+
+	unless(exists($player->{$p}{cc}))
+	{
+		Player::Tell($p, "You aren't party of any channel, use 'cc <channel>' to join a channel; see 'cw' for a list of channels.\n");
+		return (0);
+	}
+
+	unless(length($str))
+	{
+		Player::Tell($p, " Usage : cs [msg]\n");
+		return (-1);
+	}
+
+	(my $mstr, my $pstr) = Make::String::Public($str);
+
+	Custom::Wall($p, "[$player->{$p}{cc}] $player->{$p}{name} $mstr, '$str'\n");
+	return (0);
+}
+
+sub Command::Custom::Join
+{
+	my $i = shift;
+	my $c = shift;
+
+	$_ = $c;
+	if(/\S/)
+	{
+		Custom::Wall($i, "[$player->{$i}{cc}] $player->{$i}{name} leaves the channel.\n") if(exists($player->{$i}{cc}) && length($player->{$i}{cc}));
+		$player->{$i}{cc} = $c;
+		Custom::Wall($i, "[$player->{$i}{cc}] $player->{$i}{name} joins the channel.\n");
+	}
+	else
+	{
+		Custom::Wall($i, "[$player->{$i}{cc}] $player->{$i}{name} leaves the channel.\n") if(exists($player->{$i}{cc}) && length($player->{$i}{cc}));
+		delete $player->{$i}{cc};
+		Player::Tell($i, "You are no longer part of any channels.\n");
+	}
+
+	return (0);
+}
+
+sub Command::Custom::Emote
+{
+	my $p = shift;
+	my $str = shift;
+
+	unless(exists($player->{$p}{cc}))
+	{
+		Player::Tell($p, "You aren't party of any channel, use 'cc <channel>' to join a channel and see 'cw' for a list of channels.\n");
+		return (0);
+	}
+
+	unless(length($str))
+	{
+		Player::Tell($p, " Usage : ce [emotion]\n");
+		return (-1);
+	}
+
+	Custom::Wall($p, "[$player->{$p}{cc}] $player->{$p}{name} $str\n");
+	return;
+}
+
+sub Command::Custom::Think
+{
+	my $p = shift;
+	my $str = shift;
+
+	unless(exists($player->{$p}{cc}))
+	{
+		Player::Tell($p, "You aren't party of any channel, use 'cc <channel>' to join a channel; see 'cw' for a list of channels.\n");
+		return (0);
+	}
+
+	unless(length($str))
+	{
+		Player::Tell($p, " Usage : ct [thought]\n");
+		return (-1);
+	}
+
+	Custom::Wall($p, "[$player->{$p}{cc}] $player->{$p}{name} thinks . o O ( $str )\n");
+	return;
+}
+
+sub Command::Custom::Who
+{
+	my $i = shift;
+
+	unless(exists($player->{$i}{cc}))
+	{
+		Player::Tell($i, "You aren't party of any channel, use 'cc <channel>' to join a channel; see 'cw' for a list of channels.\n");
+		return (0);
+	}
+
+	Player::Banner($i, 0, '-', "People listening to $player->{$i}{cc}");
+
+	foreach my $p (keys %{$player})
+	{
+		if($player->{$p}{cc} eq $player->{$i}{cc})
+		{
+			Player::Tell($i, " + $player->{$p}{name}\n");
+		}
+	}
+
+	Player::Banner($i, 0, '-', undef);
+	return (0);
+}
+
+sub Command::Custom::List
+{
+	my $i = shift;
+	my %c;
+
+	Player::Banner($i, 0, '-', "Channels on $config->{'talker.name'}");
+
+	foreach my $p (keys %{$player})
+	{
+		if(exists($player->{$p}{cc}))
+		{
+			$c{$player->{$p}{cc}} = $player->{$p}{cc};
+		}
+	}
+
+	Player::Tell($i, join(', ', sort(keys(%c))));
+	Player::Tell($i, "\n");
+	Player::Banner($i, 0, '-', undef);
+	return (0);
+}
+
+sub Command::Help
+{
+	my $i = shift;
+	my $str = shift;
+	my $section;
+	my $topic;
+
+	length($str) or $str = 'intro';
+
+	$_ = $str;
+
+	if(/^(\d+)\.(.*)$/)
+	{
+		$section = $1;
+		$str = $2;
+	}
+
+	if(Check::RE($str) == -1)
+	{
+		Player::Tell($i, "That's an invalid keyword.\n");
+		return (-1);
+	}
+
+	my $list = Help::Find::Topic($str);
+
+	if($list == -1)
+	{
+		Player::Tell($i, "Couldn't find help on that topic.\n");
+		Admin::Wall("[AD] $player->{$i}{name} tried to find help on topic `$str'\n");
+		return (-1);
+	}
+
+	if(scalar(@{$list}) > 1)
+	{
+		if($section)
+		{
+			$section--;
+			$topic = $list->[$section];
+			unless($topic)
+			{
+				Player::Tell($i, "Couldn't find that section on that topic.\n");
+				Admin::Wall("[AD] $player->{$i}{name} tried to find help on topic `$str'\n");
+				return (-1);
+			}
+		}
+		else
+		{
+			Player::Tell($i, "There is help available on the following topics:\n");
+			my $count = 1;
+
+			foreach my $key (@{$list})
+			{
+				Player::Tell($i, sprintf("[%3d] %s\n", $count, $key));
+				$count++;
+			}
+
+			return (0);
+		}
+	}
+	elsif(scalar(@{$list}) == 1)
+	{
+		$topic = $list->[0];
+	}
+	else
+	{
+		Player::Tell($i, "Couldn't find help on that topic.\n");
+		Admin::Wall("[AD] $player->{$i}{name} tried to find help on topic `$str'\n");
+		return (-1);
+	}
+
+	Player::Tell($i, "^YKeywords are: '^C", join(' ', @{$help->{$topic}{keyword}}), "^Y'^N\n");
+	Player::Tell($i, $help->{$topic}{text});
+	Player::Tell($i, "^YSee Also: '^C", join(' ', @{$help->{$topic}{seealso}}), "^Y'^N\n");
+	return (0);
+}
+
+sub Command::Lsu
+{
+	my $i = shift;
+	my $str;
+	my $count;
+	my @list;
+
+	foreach my $p (sort { $player->{$a}{name} cmp $player->{$b}{name} }(keys %{$player}))
+	{
+		if($player->{$p}{privs} & SU)
+		{
+			push(@list, $player->{$p}{name});
+			$count++;
+		}
+	}
+
+	if(scalar(@list) == 1)
+	{
+		Player::Center($i, '-', 'Supers on');
+		Player::Tell($i, $list[0], "\n");
+		Player::Center($i, '-', 'There is one Super User connected');
+		return (0);
+	}
+	elsif(scalar(@list) > 1)
+	{
+		Player::Center($i, '-', 'Supers on');
+		my $calc = 0;
+		foreach my $key (@list)
+		{
+			if($calc % 2 == 0)
+			{
+				$calc++;
+				Player::Tell($i, sprintf("%-32s", $key));
+			}
+			else
+			{
+				$calc--;
+				Player::Tell($i, "$key\n");
+			}
+		}
+		if($calc % 2 != 0)
+		{
+			Player::Tell($i, "\n");
+		}
+
+		Player::Center($i, '-', 'There are ', Make::Word::Number($count), ' Super Users connected');
+		return (0);
+	}
+	else
+	{
+		Player::Tell($i, "There are no Super Users currently connected.\n");
+		return (0);
+	}
+}
+
+sub Command::Time
+{
+	my $i = shift;
+
+	Player::Tell($i, "$config->{'talker.name'}'s time is ", strftime("%I:%M:%S - %m/%d/%y.", gmtime), "\n");
+	Player::Tell($i, 'We have been up for ', Make::Word::Time($config->{'uptime'}), ".\n");
+	Player::Tell($i, "That is from $config->{'boot'}.\n");
+	Player::Tell($i, 'Total number of logins in that time: ', Make::Word::Number($index), "\n");
+	Player::Tell($i, 'Total number of residents: ', Make::Word::Number(Make::Resident::Total()), "\n");
+	return (0);
+}
+
+sub Command::Who
+{
+	my $i = shift;
+	my @list;
+
+	$_ = shift;
+
+	if(/^time/i)
+	{
+		foreach my $key (sort { $player->{$a}{time_on} <=> $player->{$b}{time_on} }(keys %{$player}))
+		{
+			push(@list, $key);
+		}
+	}
+	elsif(/^az/i || /^all/i)
+	{
+		foreach my $key (sort { $player->{$a}{name} cmp $player->{$b}{name} }(keys %{$player}))
+		{
+			push(@list, $key);
+		}
+	}
+	elsif(/^za/i)
+	{
+		foreach my $key (reverse(sort { $player->{$a}{name} cmp $player->{$b}{name} }(keys %{$player})))
+		{
+			push(@list, $key);
+		}
+	}
+	elsif(/^time/i)
+	{
+		foreach my $key (sort { $player->{$a}{time_on} <=> $player->{$b}{time_on} }(keys %{$player}))
+		{
+			push(@list, $key);
+		}
+	}
+	else
+	{
+		Player::Tell($i, " Usage : who <all|az|za|time>\n");
+		return (-1);
+	}
+
+	Player::Banner($i, 0, '-', "There ", scalar(@list) == 1 ? 'is ' : 'are ', 
+	Make::Word::Number(scalar(@list)), scalar(@list) == 1 ? ' person' : ' people', " on $config->{'talker.name'}");
+
+	if($player->{$i}{privs} & SU)
+	{
+		Player::Tell($i, "[time on][who                ][idle][rank][zombie][ip             ][fd]\n");
+	}
+	else
+	{
+		Player::Tell($i, "[time on][who                ][idle][rank][zombie]\n");
+	}
+
+	foreach my $key (@list)
+	{
+		if($player->{$i}{privs} & SU)
+		{
+			Player::Tell($i, sprintf(" %-8s %-20s %-5s %-5s %-7s %-16s %s\n", Player::Get::TimeOn($key),
+			exists($player->{$key}{name}) ? $player->{$key}{name} : '<NULL>', Player::Get::Idle($key),
+			Player::Get::Rank($key), $player->{$key}{state} & ZOMBIE ? 'yes' : 'no',
+			exists($socket->{$key}) ? $socket->{$key}{ip} : 'xxx.xxx.xxx.xxx', Player::Get::Socket($key)));
+		}
+		else
+		{
+			$player->{$key}{state} & LOGGED_IN or next;
+			Player::Tell($i, sprintf(" %-8s %-20s %-5s %-5s %s\n", Player::Get::TimeOn($key),
+			exists($player->{$key}{name}) ? $player->{$key}{name} : '<NULL>', Player::Get::Idle($key),
+			Player::Get::Rank($key), $player->{$key}{state} & ZOMBIE ? 'yes' : 'no'));
+		}
+	}
+
+	Player::Banner($i, 0, '-', undef);
+	return (0);
+}
+
+sub Command::Swho
+{
+	my $i = shift;
+	my @list;
+
+	foreach my $key (sort { $player->{$a}{name} cmp $player->{$b}{name} }(keys %{$player}))
+	{
+		$player->{$key}{state} & LOGGED_IN or next;
+		if($player->{$key}{state} & ZOMBIE)
+		{
+			push(@list, "*$player->{$key}{name}");
+		}
+		elsif($player->{$key}{privs} & SU)
+		{
+			push(@list, "($player->{$key}{name})");
+		}
+		else
+		{
+			push(@list, $player->{$key}{name});
+		}
+	}
+
+	Player::Tell($i, 'There ', scalar(@list) == 1 ? 'is only ' : 'are ', Make::Word::Number(scalar(@list)), scalar(@list) == 1 ? ' person ' : ' people ', "connected to $config->{'talker.name'}.\n");
+
+	my $count = 0;
+
+	foreach my $key (@list)
+	{
+		if($count != 2)
+		{
+			$count++;
+			Player::Tell($i, sprintf("%-25s", $key));
+		}
+		else
+		{
+			$count = 0;
+			Player::Tell($i, sprintf("%-25s\n", $key));
+		}
+	}
+
+	if($count != 0)
+	{
+		Player::Tell($i, "\n");
+	}
+
+	return (0);
+}
+
+sub Command::Examine
+{
+	my $p = shift;
+	my $arg = shift;
+	my @sync;
+
+	length($arg) or $arg = $player->{$p}{name};
+
+	(my $list, my $error) = Find::Player($p, $arg, 1);
+
+	foreach my $dude (@{$error})
+	{
+		length($dude) or next;
+
+		$channel = CHAN_CUSTOM;
+		Player::Tell($p, $dude);
+		$channel = CHAN_NORMAL;
+	}
+
+	foreach my $dude (keys %{$list})
+	{
+		if(ref($list->{$dude}) eq 'ARRAY')
+		{
+			my @mm;
+			foreach my $mm (@{$list->{$dude}})
+			{
+				push(@mm, $player->{$mm}{name});
+			}
+			my $mm = join(', ', @mm);
+
+			Player::Tell($p, "Multiple matches: ($dude) $mm\n");
+		}
+		elsif(!(length($dude)))
+		{
+			$channel = CHAN_CUSTOM;
+			Player::Tell($p, "Bad syntax\n");
+			$channel = CHAN_NORMAL;
+		}
+		else
+		{
+			push(@sync, $list->{$dude});
+		}
+	}
+
+	foreach my $k (@sync)
+	{
+		Command::Examine::Final($p, $k);
+	}
+
+	return (0);
+}
+
+sub Command::Examine::Final
+{
+	my $i = shift;
+	my $p = shift;
+
+	Player::Banner($i, 0, '-', undef);
+	Player::Tell($i, "$player->{$p}{name} $player->{$p}{title}\n");
+	Player::Banner($i, 0, '-', undef);
+
+	if(length($player->{$p}{description}))
+	{
+		Player::Tell($i, "$player->{$p}{description}\n");
+		Player::Banner($i, 0, '-', undef);
+	}
+
+	Player::Tell($i, "$player->{$p}{name} has been logged in for ", Make::Word::Time($player->{$p}{time_on}), "\n");
+	Player::Tell($i, 'That is from ', strftime("%I.%M:%S - %a, %d %B", @{$player->{$p}{start}}), ".\n");
+	Player::Tell($i, ucfirst(Player::Get::HisHer($p)), " total login time is ", Make::Word::Time($player->{$p}{total_login}), "\n");
+
+	if($p == $i)
+	{
+		Player::Banner($i, 0, '-', undef);
+		Player::Tell($i, "Your entermsg is set to ..\n");
+		Player::Tell($i, $player->{$p}{name}, ' ', $player->{$p}{entermsg}, "\n");
+	}
+
+	Player::Banner($i, 0, '-', undef);
+	return (0);
+}
+
+sub Command::Admin::Release
+{
+	my $i = shift;
+	my $fd = int(shift);
+
+	if($fd == 0)
+	{
+		Player::Tell($i, " Usage : release <pid> (see list via ^Hps^N)\n");
+		return (-1);
+	}
+
+	if($fd == $i)
+	{
+		Player::Tell($i, "Let's not create a paradox, ok?\n");
+		return (-1);
+	}
+	elsif(exists($player->{$fd}))
+	{
+		Admin::Wall(" -=> $player->{$i}{name} releases pid $fd ($player->{$fd}{name}) from the player structure.\n");
+		delete $player->{$fd};
+	}
+	else
+	{
+		Player::Tell($i, "Couldn't find pid $fd in the player structure.\n");
+	}
+
+	if(exists($socket->{$fd}))
+	{
+		Makelog('disconnect', "disconnecting id $fd from $socket->{$fd}{ip}");
+		Admin::Wall(" -=> $player->{$i}{name} releases fd $fd ($socket->{$fd}{ip}) from the socket structure.\n");
+		$socket_select->remove($socket->{$fd}{sock});
+		$socket->{$fd}{sock}->close;
+		delete $socket->{$fd};
+	}
+	else
+	{
+		Player::Tell($i, "Couldn't find pid $fd in the player structure.\n");
+	}
+
+	return (0);
+}
+
+sub Command::WW
+{
+	my $i = shift;
+	my $arg = int(shift);
+
+	if($arg == 0)
+	{
+		Player::Tell($i, " Usage : ww <your terminal's column size>\n");
+		return (-1);
+	}
+	elsif($arg < 20 || $arg > 130)
+	{
+		Player::Tell($i, "Let's set a more reasonable size.\n");
+		return (-1);
+	}
+	else
+	{
+		$player->{$i}{ww} = $arg;
+		$socket->{$i}{x} = $arg;
+		Player::Tell($i, "Set wordwrap to $arg columns.\n");
+		return (0);
+	}
+}
+
+sub Command::AutoTerm
+{
+	my $i = shift;
+
+	$player->{$i}{flags} ^= USE_AUTO_TERM;
+
+	$player->{$i}{flags} & USE_AUTO_TERM ? Player::Tell($i, "Auto-terminal on.\n") : Player::Tell($i, "Auto-terminal off.\n");
+	return (0);
+}
+
+sub Command::Resident
+{
+	my $p = shift;
+	my $arg = shift;
+	my @sync;
+
+	unless(length($arg))
+	{
+		Player::Tell($p, " Usage : resident <player,...>\n");
+		return (-1);
+	}
+
+	(my $list, my $error) = Find::Player($p, $arg, 1);
+
+	foreach my $dude (@{$error})
+	{
+		length($dude) or next;
+
+		$channel = CHAN_CUSTOM;
+		Player::Tell($p, $dude);
+		$channel = CHAN_NORMAL;
+	}
+
+	foreach my $dude (keys %{$list})
+	{
+		if(ref($list->{$dude}) eq 'ARRAY')
+		{
+			my @mm;
+			foreach my $mm (@{$list->{$dude}})
+			{
+				push(@mm, $player->{$mm}{name});
+			}
+			my $mm = join(', ', @mm);
+
+			Player::Tell($p, "Multiple matches: ($dude) $mm\n");
+		}
+		elsif(!(length($dude)))
+		{
+			$channel = CHAN_CUSTOM;
+			Player::Tell($p, "Bad syntax\n");
+			$channel = CHAN_NORMAL;
+		}
+		else
+		{
+			push(@sync, $list->{$dude});
+		}
+	}
+
+	foreach my $k (@sync)
+	{
+		Command::Resident::Final($p, $k);
+	}
+
+	return (0);
+}
+
+sub Command::Resident::Final
+{
+	my $i = shift;
+	my $p = shift;
+
+	if($player->{$p}{privs} & RESIDENT)
+	{
+		Player::Tell($i, "$player->{$p}{name} is already a resident.\n");
+		return (-1);
+	}
+
+	$player->{$p}{res_wait} = 60;
+	Player::Tell($p, "^HYou are being evaluated for residency.  This process takes 60 seconds if all goes well.  There's no use to ask for residency again.  $player->{$i}{name} will notify you if there are any problems.\n");
+
+	Player::Tell($i, "You put $player->{$p}{name} up for residency evaluation.\n");
+	SU::Wall(" -=> $player->{$i}{name} is evaluating $player->{$p}{name} for residency.  If you object to this motion type ^Hobject <name>^N\n");
+
+	return (0);
+}
+
+sub Command::Object
+{
+	my $i = shift;
+	my $arg = shift;
+
+	unless(length($arg))
+	{
+		Player::Tell($i, " Usage : object <full name>\n");
+		return (-1);
+	}
+
+	foreach my $key (keys %{$player})
+	{
+		if($player->{$key}{name} eq $arg)
+		{
+			if($player->{$key}{privs} & RESIDENT)
+			{
+				Player::Tell($i, "$player->{$key}{name} is a resident, doofus.\n");
+				return (-1);
+			}
+
+			if(exists($player->{$key}{res_wait}))
+			{
+				Player::Tell($key, "^HYou residency has been objected.^N\n");
+				delete $player->{$key}{res_wait};
+				SU::Wall("-=> $player->{$i}{name} objects to $player->{$key}{name}'s residency.\n");
+				return (0);
+			}
+
+			Player::Tell($i, "They aren't being evaluated, dork.\n");
+			return (-1);
+		}
+	}
+
+	Player::Tell($i, "Couldn't find that victim.\n");
+	return (-1);
+}
+
+sub Command::Toggle::Color
+{
+	my $i = shift;
+
+	$player->{$i}{flags} ^= NO_COLOR;
+
+	$player->{$i}{flags} & NO_COLOR ? Player::Tell($i, "Color off.\n") : Player::Tell($i, "^RColor on^N.\n");
+	return (0);
+}

@@ -1,0 +1,77 @@
+# Helpfile Database Format
+# @<expression> <value>
+
+@topic intro
+@keywords intro,help,newbie
+@seealso 2.intro,3.intro,4.intro
+
+^Y   _       _           _
+^Y  /_\  _ _| |_ ___ ___| |__
+^Y / _ \| ' \  _/ -_) -_) / /
+^Y/_/ \_\_||_\__\___\___|_\_\^N
+
+^HHelp System^N
+
+Welcome to Prancing Pony Inn.  This help engine is driven by keywords and
+topics.  To use help, just give the engine a topic to search
+
+help communication
+
+If the engine returns with multiple results, you can pick which section
+you would like to read, by re-entering the command, prefixed with the
+section number and a period
+
+help 1.communication
+
+It's strongly recommended you read 2.intro, 3.intro, and 4.intro for
+command usage, general information, and references.
+
+@topic say
+@keywords say,says,communication,talk,speak
+@seealso emote,echo,think
+
+^HNAME^N
+	Say - say something to the people within the same room as you
+
+^HSYNOPSIS^N
+	say <message>
+
+^HDESCRIPTION^N
+	Say will display a message from yourself to the others within
+	the same room, as if you were speaking to them.  Say is somewhat
+	intelligent so that it calculates the proper string based on what
+	you want to say.  For instance, if your message ended with a
+	question mark the string would be 'asks'.
+
+^HSHORTCUTS^N
+	' ` and " are shortcuts for Say.  All shortcuts can be used without
+	spaces between the command and message, like so:
+
+	'hello world
+
+@topic emote
+@keywords emote,communication,talk,speak
+@seealso say,echo,think
+
+^HNAME^N
+	Emote - say something to the people within the same room as you with
+	emotion
+
+^HSYNOPSIS^N
+	emote <emotion>
+
+^HDESCRIPTION^N
+	Emote will display a message from yourself to the others within
+	the same room, as if you were expressing an emotion to them. Emote
+	is somewhat intelligant so that it calulates the difference between
+	emotions and possessivness.  For instance, if your message started
+	with an apostrophe: emote 's head is spinning
+	Emote would calculate that to be possessive, and result into the
+	following string: rohan's head is spinning
+
+^HSHORTCUTS^N
+	; and : are shortcuts for Emote.  All shortcuts can be used without
+	spaces between the command and message, like so:
+
+	;smiles
+

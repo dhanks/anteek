@@ -1,0 +1,14 @@
+Subcommands available inside the editor are:
+
+^Hedit^N         Return back to the editor, appending to your input.
+
+^Hwipe^N         This will completely wipe your buffer, eliminating all
+             prior input.
+
+^Hview^N         Will print out a line-delimited view of the data you have
+             entered.
+
+^H@^N            Will exit and NOT save.
+
+^H@@^N           Will save all changes and exit the editor.
+
